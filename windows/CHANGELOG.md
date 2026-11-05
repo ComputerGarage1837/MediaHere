@@ -3,6 +3,11 @@
 All notable changes to the Windows edition are listed here. The section for each version is shown
 to users inside the app when an update is available.
 
+## v1.0.1 — 2026-11-05
+
+### Changed
+- Maintenance release to verify the MediaHere update pipeline end to end.
+
 ## v1.0.0 — 2026-11-05
 
 ### Added
