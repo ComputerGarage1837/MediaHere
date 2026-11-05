@@ -1,0 +1,33 @@
+# Android / Gradle build output
+build/
+/app/build/
+out/
+dist/
+.gradle/
+.idea/
+*.iml
+.DS_Store
+/captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+*.apk
+*.aab
+*.aab.zip
+
+# Signing material (never commit)
+*.keystore
+*.jks
+release-signing.env
+signing/
+secrets/
+
+# Local credentials and test data
+*.env
+test-accounts/
+
+# Windows (.NET) build output
+windows/**/bin/
+windows/**/obj/
+windows/**/*.user
+.vs/

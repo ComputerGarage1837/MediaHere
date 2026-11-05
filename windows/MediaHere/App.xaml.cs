@@ -1,0 +1,84 @@
+using System.Windows;
+using System.Windows.Threading;
+using MediaHere.Data;
+using MediaHere.Transfer;
+using MediaHere.UI;
+using MediaHere.Util;
+
+namespace MediaHere;
+
+/// <summary>
+/// Application entry point (the counterpart of MediaHereApp): sets up logging, the crash safety
+/// net, the transfer engine and the tray icon, then opens the main window (or stays in the tray
+/// when started by a scheduled recording with --tray).
+/// </summary>
+public partial class App : Application
+{
+    public static bool StartInTray { get; private set; }
+    public static MainWindow? Window { get; private set; }
+
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+        if (e.Args.Contains("--apply-update"))
+        {
+            // Update helper (the new version's exe run from the staged folder): copy the files in and exit.
+            AppPaths.Ensure();
+            AppLog.Init();
+            Shutdown(Update.Installer.ApplyFromArgs(e.Args));
+            return;
+        }
+        AppPaths.Ensure();
+        AppLog.Init();
+        Update.Installer.CleanLeftovers();
+        Update.Installer.ReportSetupResult();
+        StartInTray = e.Args.Any(a => string.Equals(a, "--tray", StringComparison.OrdinalIgnoreCase));
+
+        // Crash safety net: log it and offer the log on the next start.
+        AppDomain.CurrentDomain.UnhandledException += (_, ev) => Crash(ev.ExceptionObject as Exception ?? new Exception(ev.ExceptionObject?.ToString()));
+        DispatcherUnhandledException += (_, ev) =>
+        {
+            // Recoverable: the app keeps running, so it is logged as an error, not marked as a crash.
+            AppLog.E("App", "unhandled UI error (recovered)", ev.Exception);
+            ev.Handled = true;
+            try { Dialogs.Toast("Something went wrong: " + ev.Exception.Message); } catch { }
+        };
+        TaskScheduler.UnobservedTaskException += (_, ev) => { AppLog.E("App", "unobserved task exception", ev.Exception); ev.SetObserved(); };
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Prefs.Flush();
+
+        Task.Run(Player.TimeshiftServer.Cleanup);
+        Tray.Init();
+        TransferService.RescheduleAll();
+        TransferService.RenameCompleted();
+
+        Window = new MainWindow();
+        if (StartInTray)
+        {
+            // Started by a scheduled recording: run in the background; the tray icon opens the window.
+            Tray.ShowBalloon("MediaHere", "Recording in the background. Double-click the tray icon to open the app.");
+        }
+        else
+        {
+            Window.Show();
+        }
+        Player.PlayerCore.Warm();
+    }
+
+    private static void Crash(Exception e)
+    {
+        try
+        {
+            AppLog.Crash("Crash", "uncaught exception", e);
+            Prefs.Instance.Crashed = true;
+            Prefs.Flush();
+        }
+        catch { }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        Prefs.Flush();
+        Tray.Dispose();
+        base.OnExit(e);
+    }
+}

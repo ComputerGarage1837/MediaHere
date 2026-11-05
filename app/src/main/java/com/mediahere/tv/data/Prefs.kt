@@ -1,0 +1,201 @@
+package com.mediahere.tv.data
+
+import android.content.Context
+import android.content.SharedPreferences
+
+class Prefs(context: Context) {
+
+    private val sp: SharedPreferences =
+        context.applicationContext.getSharedPreferences("mediahere", Context.MODE_PRIVATE)
+
+    // ---- Accounts ------------------------------------------------------
+
+    fun account(service: Service): Account? {
+        val user = sp.getString(k(service, "user"), null) ?: return null
+        val pass = sp.getString(k(service, "pass"), null) ?: return null
+        return Account(
+            username = user,
+            password = pass,
+            status = sp.getString(k(service, "status"), null),
+            expDate = sp.getLong(k(service, "exp"), -1L).takeIf { it > 0 },
+            maxConnections = sp.getString(k(service, "maxc"), null),
+            activeConnections = sp.getString(k(service, "activec"), null),
+            createdAt = sp.getLong(k(service, "created"), -1L).takeIf { it > 0 },
+            isTrial = sp.getBoolean(k(service, "trial"), false)
+        )
+    }
+
+    fun isSignedIn(service: Service): Boolean = account(service) != null
+
+    fun saveAccount(service: Service, a: Account) {
+        sp.edit()
+            .putString(k(service, "user"), a.username)
+            .putString(k(service, "pass"), a.password)
+            .putString(k(service, "status"), a.status)
+            .putLong(k(service, "exp"), a.expDate ?: -1L)
+            .putString(k(service, "maxc"), a.maxConnections)
+            .putString(k(service, "activec"), a.activeConnections)
+            .putLong(k(service, "created"), a.createdAt ?: -1L)
+            .putBoolean(k(service, "trial"), a.isTrial)
+            .apply()
+    }
+
+    fun clearAccount(service: Service) {
+        val e = sp.edit()
+        listOf("user", "pass", "status", "exp", "maxc", "activec", "created", "trial")
+            .forEach { e.remove(k(service, it)) }
+        e.apply()
+    }
+
+    // ---- Live TV categories --------------------------------------------
+
+    /** Category ids the user switched off; their channels are left out everywhere. */
+    var hiddenLiveCategories: Set<String>
+        get() = sp.getStringSet("live_hidden_cats", emptySet())?.toSet() ?: emptySet()
+        set(value) { sp.edit().putStringSet("live_hidden_cats", value).apply() }
+
+    /** Individual live channels (stream ids) the user has switched off. */
+    var hiddenLiveChannels: Set<String>
+        get() = sp.getStringSet("live_hidden_channels", emptySet())?.toSet() ?: emptySet()
+        set(value) { sp.edit().putStringSet("live_hidden_channels", value).apply() }
+
+    /**
+     * Category the guide opens on: a provider category id, [CATEGORY_FAVORITES],
+     * [CATEGORY_ALL], or null for the automatic choice ("General" if present, else All).
+     */
+    var defaultLiveCategory: String?
+        get() = sp.getString("live_default_cat", null)
+        set(value) { sp.edit().putString("live_default_cat", value).apply() }
+
+    /** "auto" (full download unless it is huge), "full", or "channel" (per-channel lookups only). */
+    var guideMode: String
+        get() = sp.getString("guide_mode", "auto") ?: "auto"
+        set(value) { sp.edit().putString("guide_mode", value).apply() }
+
+    /** Size of the last full guide download, used to estimate progress when the panel sends no length. */
+    fun guideSize(service: Service): Long = sp.getLong(k(service, "guide_size"), 0L)
+    fun setGuideSize(service: Service, bytes: Long) { sp.edit().putLong(k(service, "guide_size"), bytes).apply() }
+
+    /** Until this time (epoch ms) per-channel programme lookups are skipped: the panel answered empty for every channel asked. */
+    fun shortEpgOffUntil(service: Service): Long = sp.getLong(k(service, "short_epg_off_until"), 0L)
+    fun setShortEpgOffUntil(service: Service, until: Long) { sp.edit().putLong(k(service, "short_epg_off_until"), until).apply() }
+
+    // ---- Favorites -----------------------------------------------------
+
+    private fun favKey(service: Service, kind: ContentKind) = k(service, "favs_${kind.name.lowercase()}")
+
+    fun favorites(service: Service, kind: ContentKind): Set<String> =
+        sp.getStringSet(favKey(service, kind), emptySet())?.toSet() ?: emptySet()
+
+    fun isFavorite(service: Service, kind: ContentKind, id: String?): Boolean =
+        id != null && favorites(service, kind).contains(id)
+
+    /** Adds or removes the item; returns true when it is now a favorite. */
+    fun toggleFavorite(service: Service, kind: ContentKind, id: String): Boolean {
+        val set = favorites(service, kind).toMutableSet()
+        val nowFav = if (set.contains(id)) { set.remove(id); false } else { set.add(id); true }
+        sp.edit().putStringSet(favKey(service, kind), set).apply()
+        return nowFav
+    }
+
+    // ---- Updates -------------------------------------------------------
+
+    var skippedVersion: String?
+        get() = sp.getString("skipped_version", null)
+        set(value) { sp.edit().putString("skipped_version", value).apply() }
+
+    var autoCheckUpdates: Boolean
+        get() = sp.getBoolean("auto_check_updates", true)
+        set(value) { sp.edit().putBoolean("auto_check_updates", value).apply() }
+
+    /** Last service notice JSON fetched from the repository, shown while offline. */
+    var announcementJson: String?
+        get() = sp.getString("announcement_json", null)
+        set(value) { sp.edit().putString("announcement_json", value).apply() }
+
+    // ---- First-run ---------------------------------------------------------
+
+    /** True once the "allow installing updates" prompt has been shown (or the permission is held). */
+    var installPermissionAsked: Boolean
+        get() = sp.getBoolean("install_perm_asked", false)
+        set(value) { sp.edit().putBoolean("install_perm_asked", value).apply() }
+
+    // ---- Display -------------------------------------------------------
+
+    /** "phone", "tv", or null when the user hasn't been asked yet. */
+    var layoutMode: String?
+        get() = sp.getString("layout_mode", null)
+        set(value) { sp.edit().putString("layout_mode", value).apply() }
+
+    // ---- Folders (SAF tree URIs; null = inside the app) ------------------
+
+    var downloadFolder: String?
+        get() = sp.getString("download_folder", null)
+        set(value) { sp.edit().putString("download_folder", value).apply() }
+
+    var recordingFolder: String?
+        get() = sp.getString("recording_folder", null)
+        set(value) { sp.edit().putString("recording_folder", value).apply() }
+
+    // ---- Playback ------------------------------------------------------
+
+    /** "m3u8" (HLS) or "ts" (MPEG-TS) for live streams. */
+    var liveFormat: String
+        get() = sp.getString("live_format", "m3u8") ?: "m3u8"
+        set(value) { sp.edit().putString("live_format", value).apply() }
+
+    /** Whether subtitle tracks are shown by default (the player's CC button changes and remembers this). */
+    var subtitles: Boolean
+        get() = sp.getBoolean("subtitles", false)
+        set(value) { sp.edit().putBoolean("subtitles", value).apply() }
+
+    /** Send raw Dolby / DTS bitstreams to the TV or receiver instead of decoding on the device. Off by default. */
+    var dolbyPassthrough: Boolean
+        get() = sp.getBoolean("dolby_passthrough", false)
+        set(value) { sp.edit().putBoolean("dolby_passthrough", value).apply() }
+
+    /** Start the next episode automatically when one ends. */
+    var autoPlayNext: Boolean
+        get() = sp.getBoolean("auto_play_next", true)
+        set(value) { sp.edit().putBoolean("auto_play_next", value).apply() }
+
+    /** Downloads wait for Wi-Fi / Ethernet instead of using mobile data. */
+    var downloadsWifiOnly: Boolean
+        get() = sp.getBoolean("downloads_wifi_only", false)
+        set(value) { sp.edit().putBoolean("downloads_wifi_only", value).apply() }
+
+    /** Delete a downloaded file once it has been watched to the end. */
+    var deleteAfterWatched: Boolean
+        get() = sp.getBoolean("delete_after_watched", false)
+        set(value) { sp.edit().putBoolean("delete_after_watched", value).apply() }
+
+    /** Set synchronously by the crash handler; the home screen offers the log on the next start. */
+    var crashed: Boolean
+        get() = sp.getBoolean("crashed", false)
+        set(value) { sp.edit().putBoolean("crashed", value).commit() }
+
+    /** Multi-view: number of tiles (2 or 4) and the channel id in each slot ("" = empty). */
+    var multiviewTiles: Int
+        get() = sp.getInt("multiview_tiles", 4)
+        set(value) { sp.edit().putInt("multiview_tiles", value).apply() }
+    var multiviewSlots: List<String>
+        get() = sp.getString("multiview_slots", "")!!.split('|').let { l -> List(4) { l.getOrNull(it) ?: "" } }
+        set(value) { sp.edit().putString("multiview_slots", value.take(4).joinToString("|")).apply() }
+
+    /** Time zone every clock time is shown in: a zone id, or [Format.DEVICE_ZONE]. Eastern by default. */
+    var timeZoneId: String
+        get() = sp.getString("time_zone", Format.DEFAULT_ZONE) ?: Format.DEFAULT_ZONE
+        set(value) { sp.edit().putString("time_zone", value).apply() }
+
+    /** One of [BufferLevel.key]; how much live video the player keeps buffered. */
+    var bufferLevel: String
+        get() = sp.getString("buffer_level", BufferLevel.MAX.key) ?: BufferLevel.MAX.key
+        set(value) { sp.edit().putString("buffer_level", value).apply() }
+
+    private fun k(s: Service, key: String) = "${s.name.lowercase()}_$key"
+
+    companion object {
+        const val CATEGORY_FAVORITES = "__favorites__"
+        const val CATEGORY_ALL = "__all__"
+    }
+}

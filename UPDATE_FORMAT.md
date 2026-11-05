@@ -1,0 +1,42 @@
+# Update manifest format
+
+The in-app updater reads `release/update.json` from the `main` branch of this repository (via
+`raw.githubusercontent.com`). It compares `versionCode` with the installed build and only offers a
+newer one. The APK is downloaded from the GitHub release tagged `v<versionName>` using the asset
+named in the feed, then checked against `sha256` and `sizeBytes` before installation.
+
+The metadata uses schema version 1:
+
+```json
+{
+  "schemaVersion": 1,
+  "packageName": "com.computergarage.mediahere",
+  "versionName": "1.0.0",
+  "versionCode": 10000,
+  "apk": {
+    "assetName": "MediaHere-1.0.0.apk",
+    "sha256": "64 lowercase hexadecimal characters",
+    "sizeBytes": 12345678
+  }
+}
+```
+
+The release workflow writes this file automatically after a `v*` tag builds and publishes
+successfully, so it normally does not need to be edited by hand. If it is edited manually, the
+named APK asset must exist in the release and `sha256` / `sizeBytes` must match it exactly, or the
+app will reject the download.
+
+The application ID and signing certificate must remain unchanged for all later updates. The Android
+version code must increase with every release.
+
+## Windows
+
+The Windows app uses the same schema in `release/update-windows.json` with `setup` (the installer,
+optional) and `zip` (the portable folder) entries (`assetName`, `sha256`, `sizeBytes`) in place of `apk`, `packageName` `com.computergarage.mediahere.windows`, and
+release tags of the form `windows-v<versionName>`. See `windows/README.md`.
+
+## Service notice
+
+`release/announcement.json` (schema 1) holds the optional home-screen notice shown by both apps;
+see `ANNOUNCEMENT_FORMAT.md`. It is read by the apps, never written by the workflows, and editing
+it does not trigger a build.
