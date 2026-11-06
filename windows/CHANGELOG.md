@@ -3,6 +3,11 @@
 All notable changes to the Windows edition are listed here. The section for each version is shown
 to users inside the app when an update is available.
 
+## v1.1.5 — 2026-11-06
+
+### Changed
+- Matching card backgrounds for the Live TV and Video on Demand tiles on narrow windows.
+
 ## v1.1.4 — 2026-11-06
 
 ### Changed
