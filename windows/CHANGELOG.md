@@ -3,6 +3,11 @@
 All notable changes to the Windows edition are listed here. The section for each version is shown
 to users inside the app when an update is available.
 
+## v1.1.2 — 2026-11-06
+
+### Changed
+- Live TV and Video on Demand cards redrawn to match the design: smooth green swoosh instead of a stray line.
+
 ## v1.1.1 — 2026-11-06
 
 ### Changed
