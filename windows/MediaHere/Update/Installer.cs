@@ -144,12 +144,21 @@ public static class Installer
         try
         {
             try { File.Delete(ResultFile); } catch { }
-            var psi = new ProcessStartInfo(setupFile,
-                $"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /NOCANCEL /LOG=\"{Path.Combine(AppPaths.Data, "updates", "setup.log")}\"")
-            { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(setupFile) };
-            var p = Process.Start(psi) ?? throw new InvalidOperationException("Windows did not start the setup program");
-            // Record the outcome for the next start without holding the app open.
-            new Thread(() => { try { p.WaitForExit(); File.WriteAllText(ResultFile, p.ExitCode.ToString()); } catch { } }) { IsBackground = true }.Start();
+            var exe = Environment.ProcessPath ?? "";
+            var log = Path.Combine(AppPaths.Data, "updates", "setup.log");
+            static string Q(string v) => "'" + v.Replace("'", "''") + "'";
+            // A small hidden PowerShell watcher outlives this app: it runs the setup, records its
+            // exit code, then starts MediaHere again if nothing else (the setup's own "launch"
+            // step) already did. The app is not relied on to restart itself.
+            var script =
+                $"$p = Start-Process -FilePath {Q(setupFile)} -ArgumentList {Q($"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /NOCANCEL /LOG=\"{log}\"")} -WorkingDirectory {Q(Path.GetDirectoryName(setupFile) ?? "")} -PassThru -Wait; " +
+                $"Set-Content -Path {Q(ResultFile)} -Value $p.ExitCode; " +
+                "Start-Sleep -Seconds 4; " +
+                $"if ($p.ExitCode -eq 0 -and -not (Get-Process -Name {Q(Path.GetFileNameWithoutExtension(exe))} -ErrorAction SilentlyContinue)) {{ Start-Process -FilePath {Q(exe)} -WorkingDirectory {Q(Path.GetDirectoryName(exe) ?? "")} }}";
+            var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+            var psi = new ProcessStartInfo("powershell.exe", $"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {encoded}")
+            { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(setupFile) };
+            _ = Process.Start(psi) ?? throw new InvalidOperationException("Windows did not start the setup program");
         }
         catch (Exception e)
         {
