@@ -37,7 +37,9 @@ public partial class SeriesPage : AppPage
         Progress.Visibility = Visibility.Visible;
         try
         {
-            var episodes = await XtreamApi.SeriesInfo(_service, account, _seriesId);
+            var data = await XtreamApi.SeriesFull(_service, account, _seriesId);
+            var episodes = data.Episodes;
+            BindDetails(data.Details);
             Progress.Visibility = Visibility.Collapsed;
             if (episodes.Count == 0) { TxtError.Text = "No episodes found."; TxtError.Visibility = Visibility.Visible; }
             else
@@ -45,6 +47,7 @@ public partial class SeriesPage : AppPage
                 _episodes = episodes;
                 Render();
                 BtnDownloadAll.Visibility = Visibility.Visible;
+                LoadExtras(account, data.Details?.Genre);
                 if (IsResumed) _ = Dispatcher.BeginInvoke(() => _rows.FirstOrDefault().Row?.Focus(), System.Windows.Threading.DispatcherPriority.Input);
             }
         }
@@ -54,6 +57,36 @@ public partial class SeriesPage : AppPage
             TxtError.Text = string.IsNullOrWhiteSpace(e.Message) ? "Couldn't load content." : e.Message;
             TxtError.Visibility = Visibility.Visible;
         }
+    }
+
+    /// Actor photos and similar shows (from TMDB), matched to what this provider actually has.
+    private async void LoadExtras(Account account, string? genre)
+    {
+        try
+        {
+            var info = await Tmdb.Lookup(_title, null, series: true);
+            if (Finished) return;
+            Extras.ShowCast(info.Cast);
+            var catalogue = await CatalogCache.Get(_service, account, ContentKind.SERIES);
+            if (Finished) return;
+            var similar = Tmdb.SimilarIn(info, catalogue, _seriesId, _title);
+            Extras.ShowSimilar(similar, s => { if (s.Id != null) Nav.Push(new SeriesPage(_service, s.Id, s.Name ?? "", s.Image, s.Plot)); });
+        }
+        catch { }
+    }
+
+    /// Rating, genre, cast and trailer from the provider, when it has them.
+    private void BindDetails(Details? d)
+    {
+        if (d == null) return;
+        var facts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(d.Year)) facts.Add(d.Year!);
+        if (double.TryParse(d.Rating, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var r) && r > 0) facts.Add("★ " + r.ToString("0.0"));
+        if (!string.IsNullOrWhiteSpace(d.Genre)) facts.Add(d.Genre!);
+        if (facts.Count > 0) { TxtFacts.Text = string.Join("  ·  ", facts); TxtFacts.Visibility = Visibility.Visible; }
+        if (string.IsNullOrWhiteSpace(TxtPlot.Text) && !string.IsNullOrWhiteSpace(d.Plot)) TxtPlot.Text = d.Plot;
+        if (!string.IsNullOrWhiteSpace(d.Cast)) { TxtCast.Text = "Cast: " + d.Cast; TxtCast.Visibility = Visibility.Visible; }
+        if (d.TrailerUrl is { } url) { BtnTrailer.Visibility = Visibility.Visible; BtnTrailer.Click += (_, _) => Trailer.Open(url); }
     }
 
     public override void OnResume() => RefreshRows();
@@ -80,7 +113,7 @@ public partial class SeriesPage : AppPage
                 List.Children.Add(head);
             }
             var stack = new StackPanel();
-            var title = new TextBlock { FontSize = 15, Foreground = Ui.Brush("TextBrush"), TextTrimming = TextTrimming.CharacterEllipsis };
+            var title = new TextBlock { FontSize = 15, Foreground = Ui.Brush("TextBrush"), TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.Wrap, MaxHeight = 60 };
             var info = string.Join("  ·  ", new[] { ep.Duration, ep.Plot }.Where(s => !string.IsNullOrWhiteSpace(s)));
             var infoText = new TextBlock { Text = info, FontSize = 12, Foreground = Ui.Brush("TextMutedBrush"), TextWrapping = TextWrapping.Wrap, TextTrimming = TextTrimming.CharacterEllipsis, MaxHeight = 36, Margin = new Thickness(0, 2, 0, 0), Visibility = string.IsNullOrWhiteSpace(info) ? Visibility.Collapsed : Visibility.Visible };
             var progress = new ProgressBar { Style = Ui.Res<Style>("ThinProgress"), Margin = new Thickness(0, 6, 0, 0), Visibility = Visibility.Collapsed };

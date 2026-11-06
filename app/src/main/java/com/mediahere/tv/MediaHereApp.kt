@@ -17,6 +17,7 @@ class MediaHereApp : Application() {
             previous?.uncaughtException(thread, error)
         }
         com.mediahere.tv.data.EpgCache.init(this)
+        try { com.mediahere.tv.reminders.Reminders.schedule(this) } catch (e: Exception) { com.mediahere.tv.util.AppLog.w("Reminders", "not scheduled: ${e.message}") }
         if (android.os.Build.VERSION.SDK_INT < 25) {
             // Poster and logo downloads go through the shared client too, so the extra trusted roots apply to them.
             try {
@@ -29,6 +30,7 @@ class MediaHereApp : Application() {
             }
         }
         com.mediahere.tv.data.WatchProgress.init(this)
+        com.mediahere.tv.data.VodUsers.init(this)
         Thread { com.mediahere.tv.player.TimeshiftServer.cleanup(this) }.start()
     }
 

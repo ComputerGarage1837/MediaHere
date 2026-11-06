@@ -82,7 +82,10 @@ class Prefs(context: Context) {
 
     // ---- Favorites -----------------------------------------------------
 
-    private fun favKey(service: Service, kind: ContentKind) = k(service, "favs_${kind.name.lowercase()}")
+    private fun favKey(service: Service, kind: ContentKind): String {
+        val base = k(service, "favs_${kind.name.lowercase()}")
+        return if (service == Service.VOD) VodUsers.scope(base) else base
+    }
 
     fun favorites(service: Service, kind: ContentKind): Set<String> =
         sp.getStringSet(favKey(service, kind), emptySet())?.toSet() ?: emptySet()
@@ -148,6 +151,70 @@ class Prefs(context: Context) {
     var subtitles: Boolean
         get() = sp.getBoolean("subtitles", false)
         set(value) { sp.edit().putBoolean("subtitles", value).apply() }
+
+    /** The VOD account offers 24/7 live channels (found by asking its panel); controls the entry on the VOD home. */
+    var vodChannelsAvailable: Boolean
+        get() = sp.getBoolean("vod_channels_available", false)
+        set(value) { sp.edit().putBoolean("vod_channels_available", value).apply() }
+
+    /** How the movie and show lists are ordered: default, newest, rating, year or name. */
+    var vodSort: String
+        get() = sp.getString(VodUsers.scope("vod_sort"), "default") ?: "default"
+        set(value) { sp.edit().putString(VodUsers.scope("vod_sort"), value).apply() }
+
+    /** Open the app by itself when the box starts. */
+    var openOnBoot: Boolean
+        get() = sp.getBoolean("open_on_boot", false)
+        set(value) { sp.edit().putBoolean("open_on_boot", value).apply() }
+
+    /** The notification permission prompt was shown once already. */
+    var notificationsAsked: Boolean
+        get() = sp.getBoolean("notifications_asked", false)
+        set(value) { sp.edit().putBoolean("notifications_asked", value).apply() }
+
+    /** Subscription expiry reminders (a week and a day before, and when it ends). */
+    var expiryReminders: Boolean
+        get() = sp.getBoolean("reminders", true)
+        set(value) { sp.edit().putBoolean("reminders", value).apply() }
+
+    /** An alert when a show in My List gets a new episode. */
+    var newEpisodeAlerts: Boolean
+        get() = sp.getBoolean("new_episode_alerts", sp.getBoolean("reminders", true))
+        set(value) { sp.edit().putBoolean("new_episode_alerts", value).apply() }
+
+    /** Download new episodes of My List shows by itself, overnight on Wi-Fi. */
+    var autoDownloadNew: Boolean
+        get() = sp.getBoolean("auto_download_new", false)
+        set(value) { sp.edit().putBoolean("auto_download_new", value).apply() }
+
+    /** "<expiry epoch seconds>:<stage>" of the last expiry reminder sent for [service]. */
+    fun expiryNotified(service: Service): String? = sp.getString(k(service, "expiry_notified"), null)
+    fun setExpiryNotified(service: Service, value: String) { sp.edit().putString(k(service, "expiry_notified"), value).apply() }
+
+    /** Newest episode (season * 10000 + number) seen so far for each My List show, by series id. */
+    fun knownEpisodes(): Map<String, Int> =
+        (sp.getString(VodUsers.scope("known_episodes"), null) ?: "").split(';').mapNotNull { e ->
+            val p = e.split('=')
+            if (p.size == 2) p[1].toIntOrNull()?.let { p[0] to it } else null
+        }.toMap()
+    fun setKnownEpisodes(map: Map<String, Int>) {
+        sp.edit().putString(VodUsers.scope("known_episodes"), map.entries.joinToString(";") { "${it.key}=${it.value}" }).apply()
+    }
+
+    /** New episodes waiting to be downloaded (tab separated lines, see Reminders). */
+    var pendingEpisodes: Set<String>
+        get() = sp.getStringSet("pending_episodes", emptySet())?.toSet() ?: emptySet()
+        set(value) { sp.edit().putStringSet("pending_episodes", value).apply() }
+
+    /** Language (ISO code) of the audio track the viewer last chose; preferred on every stream from then on. */
+    var audioLanguage: String?
+        get() = sp.getString("audio_language", null)
+        set(value) { sp.edit().putString("audio_language", value).apply() }
+
+    /** Language of the subtitle track the viewer last chose. */
+    var subtitleLanguage: String?
+        get() = sp.getString("subtitle_language", null)
+        set(value) { sp.edit().putString("subtitle_language", value).apply() }
 
     /** Send raw Dolby / DTS bitstreams to the TV or receiver instead of decoding on the device. Off by default. */
     var dolbyPassthrough: Boolean

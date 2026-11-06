@@ -114,6 +114,32 @@ class SettingsActivity : AppCompatActivity() {
         b.switchWifiOnly.setOnCheckedChangeListener { _, on -> prefs.downloadsWifiOnly = on }
         b.switchDeleteWatched.isChecked = prefs.deleteAfterWatched
         b.switchDeleteWatched.setOnCheckedChangeListener { _, on -> prefs.deleteAfterWatched = on }
+        b.switchReminders.isChecked = prefs.expiryReminders
+        b.switchReminders.setOnCheckedChangeListener { _, on ->
+            prefs.expiryReminders = on
+            if (on) askNotificationPermission()
+        }
+        b.switchNewEpisodeAlerts.isChecked = prefs.newEpisodeAlerts
+        b.switchNewEpisodeAlerts.setOnCheckedChangeListener { _, on ->
+            prefs.newEpisodeAlerts = on
+            if (on) askNotificationPermission()
+        }
+        b.switchAutoDownloadNew.isChecked = prefs.autoDownloadNew
+        b.switchAutoDownloadNew.setOnCheckedChangeListener { _, on ->
+            prefs.autoDownloadNew = on
+            if (on) askNotificationPermission()
+        }
+        b.switchOpenOnBoot.isChecked = prefs.openOnBoot
+        b.switchOpenOnBoot.setOnCheckedChangeListener { v, on ->
+            if (on && android.os.Build.VERSION.SDK_INT >= 29 && !android.provider.Settings.canDrawOverlays(this)) {
+                // Android 10+ only lets an app open itself from the background with this permission.
+                v.isChecked = false
+                Toast.makeText(this, R.string.open_on_boot_permission, Toast.LENGTH_LONG).show()
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName")))
+                } catch (_: Exception) {}
+            } else prefs.openOnBoot = on
+        }
         b.rowSubtitles.setOnClickListener { pickSubtitles() }
         b.rowDolby.setOnClickListener { pickDolby() }
         renderSubtitles()
@@ -177,6 +203,13 @@ class SettingsActivity : AppCompatActivity() {
                 d.dismiss()
             }
             .show()
+    }
+
+    /** Android 13+ asks before an app may show notifications. */
+    private fun askNotificationPermission() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) androidx.core.app.ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 72)
     }
 
     private fun renderSubtitles() {

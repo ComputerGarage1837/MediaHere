@@ -3,6 +3,11 @@
 All notable changes to the Windows edition are listed here. The section for each version is shown
 to users inside the app when an update is available.
 
+## v1.1.0 — 2026-11-06
+
+### Changed
+- Rebuilt on the latest app: VOD users with their own watched list and My List, casting, expiry reminders and new-episode alerts, cast photos, similar titles, weekly auto backup, and an always-on-top mini player.
+
 ## v1.0.0 — 2026-11-05
 
 ### Added

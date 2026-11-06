@@ -4,7 +4,9 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Web;
+using MediaHere.Util;
 
 namespace MediaHere.Data;
 
@@ -79,7 +81,51 @@ public static class XtreamApi
     }
 
     /// Episodes of a series grouped by season (`get_series_info`).
-    public static async Task<List<Episode>> SeriesInfo(Service service, Account account, string seriesId)
+    public static async Task<List<Episode>> SeriesInfo(Service service, Account account, string seriesId) =>
+        (await SeriesFull(service, account, seriesId).ConfigureAwait(false)).Episodes;
+
+    /// Reads the `info` object of a get_vod_info / get_series_info answer; null when it has nothing useful.
+    private static Details? ParseDetails(JsonElement? infoEl)
+    {
+        if (infoEl is not { ValueKind: JsonValueKind.Object } info) return null;
+        string? S(params string[] names)
+        {
+            foreach (var n in names)
+            {
+                var v = info.Get(n);
+                if (v == null) continue;
+                var t = v.Value.ValueKind == JsonValueKind.Array ? (v.Value.GetArrayLength() > 0 ? v.Value[0].Str() : null) : v.Value.Str();
+                t = t?.Trim();
+                if (!string.IsNullOrEmpty(t) && t != "0") return t;
+            }
+            return null;
+        }
+        var yearText = S("releasedate", "release_date", "releaseDate", "year");
+        var year = yearText == null ? null : Regex.Match(yearText, @"(19|20)\d{2}").Value;
+        if (string.IsNullOrEmpty(year)) year = null;
+        var rating = S("rating", "rating_5based");
+        if (rating != null && !double.TryParse(rating, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _)) rating = null;
+        var d = new Details(S("plot", "description"), S("cast", "actors"), S("director"), S("genre"), year, rating,
+            S("duration", "episode_run_time"), S("youtube_trailer", "trailer"), S("backdrop_path", "backdrop"), S("movie_image", "cover_big", "cover"));
+        var empty = d.Plot == null && d.Cast == null && d.Director == null && d.Genre == null && d.Year == null && d.Rating == null && d.Duration == null && d.Trailer == null;
+        return empty ? null : d;
+    }
+
+    /// Cast, rating, trailer and so on for a movie (get_vod_info); null when the provider has none.
+    public static async Task<Details?> VodInfo(Service service, Account account, string streamId)
+    {
+        var body = await Get(ApiUrl(service, account.Username, account.Password, "get_vod_info",
+            new Dictionary<string, string> { ["vod_id"] = streamId })).ConfigureAwait(false);
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            return doc.RootElement.ValueKind == JsonValueKind.Object ? ParseDetails(doc.RootElement.Get("info")) : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    /// A show's details and its episodes from one get_series_info request.
+    public static async Task<SeriesData> SeriesFull(Service service, Account account, string seriesId)
     {
         var body = await Get(ApiUrl(service, account.Username, account.Password, "get_series_info",
             new Dictionary<string, string> { ["series_id"] = seriesId })).ConfigureAwait(false);
@@ -88,9 +134,10 @@ public static class XtreamApi
         using (doc)
         {
             var root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object) return new();
+            if (root.ValueKind != JsonValueKind.Object) return new SeriesData(null, new());
+            var details = ParseDetails(root.Get("info"));
             var episodes = root.Get("episodes");
-            if (episodes == null) return new();
+            if (episodes == null) return new SeriesData(details, new());
             var outList = new List<Episode>();
 
             void Add(string seasonKey, JsonElement arr)
@@ -123,7 +170,7 @@ public static class XtreamApi
                 var i = 0;
                 foreach (var v in episodes.Value.EnumerateArray()) Add((++i).ToString(), v);
             }
-            return outList.OrderBy(e => e.Season).ThenBy(e => e.Number).ToList();
+            return new SeriesData(details, outList.OrderBy(e => e.Season).ThenBy(e => e.Number).ToList());
         }
     }
 
@@ -225,11 +272,12 @@ public static class XtreamApi
     public static string MovieUrl(Service service, Account account, string streamId, string? ext) =>
         $"{ServerUrl(service)}/movie/{Seg(account.Username)}/{Seg(account.Password)}/{Seg(streamId + "." + (string.IsNullOrWhiteSpace(ext) ? "mp4" : ext))}";
 
-    public static string StreamUrl(Service service, Account account, Stream stream, string liveFormat)
+    /// `live` says the stream is a live channel even on the VOD account (24/7 channels).
+    public static string StreamUrl(Service service, Account account, Stream stream, string liveFormat, bool? live = null)
     {
         var baseUrl = ServerUrl(service);
         var id = stream.StreamId ?? throw new ApiException("Stream has no id");
-        if (service.Kind() == ContentKind.LIVE)
+        if (live ?? service.Kind() == ContentKind.LIVE)
             return $"{baseUrl}/live/{Seg(account.Username)}/{Seg(account.Password)}/{Seg(id + "." + liveFormat)}";
         var ext = !string.IsNullOrWhiteSpace(stream.ContainerExtension) ? stream.ContainerExtension! : "mp4";
         return $"{baseUrl}/movie/{Seg(account.Username)}/{Seg(account.Password)}/{Seg(id + "." + ext)}";
@@ -252,6 +300,7 @@ public static class XtreamApi
     {
         var trimmed = body.Trim();
         // Some panels answer with an object (e.g. an error) instead of a list.
+        if (trimmed.StartsWith('<')) throw new ApiException(HTML_MESSAGE);
         if (!trimmed.StartsWith("[")) return new();
         try { return JsonSerializer.Deserialize<List<T>>(trimmed, Json.Options) ?? new(); }
         catch (JsonException) { throw new ApiException("Unexpected response from server"); }
@@ -266,28 +315,57 @@ public static class XtreamApi
         return sb.ToString();
     }
 
+    private const string HTML_MESSAGE =
+        "The service sent back a web page instead of data. That usually means a block page, a maintenance page or too many requests. Try again in a few minutes.";
+
+    private static string HttpMessage(int code) => code switch
+    {
+        401 or 403 => $"The service refused the request (HTTP {code}). Check the username and password; if they are right, the account may be over its connection limit or temporarily blocked for making too many requests. Wait a few minutes and try again.",
+        404 => "The service's address was not found (HTTP 404). The service may have moved.",
+        429 or 458 or 509 => $"Too many connections on this account at once (HTTP {code}). Close the app on other devices and try again.",
+        >= 500 and <= 599 => $"The service's server has a problem right now (HTTP {code}). Try again in a few minutes.",
+        _ => $"The service returned an error (HTTP {code})."
+    };
+
     private static async Task<string> Get(string url)
     {
         var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.UserAgent.ParseAdd(USER_AGENT);
         req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+        var safe = AppLog.SafeUrl(url);
+        var started = Environment.TickCount64;
         try
         {
             using var resp = await Client.SendAsync(req).ConfigureAwait(false);
             var text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var ct = resp.Content.Headers.ContentType?.MediaType ?? "";
+            var ms = Environment.TickCount64 - started;
+            var code = (int)resp.StatusCode;
             if (!resp.IsSuccessStatusCode)
             {
-                if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                    throw new ApiException("Invalid username or password");
-                throw new ApiException($"Server error (HTTP {(int)resp.StatusCode})");
+                AppLog.E("Api", $"GET {safe} -> HTTP {code} ({ct}, {text.Length} chars, {ms}ms) body: {Snippet(text)}");
+                throw new ApiException(HttpMessage(code));
             }
-            if (string.IsNullOrWhiteSpace(text)) throw new ApiException("Empty response from server");
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                AppLog.E("Api", $"GET {safe} -> HTTP {code} but an empty body ({ms}ms)");
+                throw new ApiException("Empty response from server");
+            }
+            if (ct.Contains("html", StringComparison.OrdinalIgnoreCase) && text.TrimStart().StartsWith('<'))
+            {
+                AppLog.E("Api", $"GET {safe} -> HTTP {code} returned a web page instead of data ({ct}, {ms}ms): {Snippet(text)}");
+                throw new ApiException(HTML_MESSAGE);
+            }
+            AppLog.I("Api", $"GET {safe} -> HTTP {code} ({ct}, {text.Length} chars, {ms}ms)");
             return text;
         }
         catch (Exception e) when (e is HttpRequestException or IOException or TaskCanceledException)
         {
+            AppLog.E("Api", $"GET {safe} failed after {Environment.TickCount64 - started}ms: {e.GetType().Name}: {e.Message}");
             throw new ApiException($"Can't reach server: {(e is TaskCanceledException ? "timed out" : e.Message)}");
         }
     }
+
+    private static string Snippet(string text) => text.Length <= 300 ? text.Replace('\n', ' ') : text[..300].Replace('\n', ' ');
 }

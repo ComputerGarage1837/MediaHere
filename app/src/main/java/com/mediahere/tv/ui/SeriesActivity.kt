@@ -53,11 +53,15 @@ class SeriesActivity : AppCompatActivity() {
 
         b.listEpisodes.layoutManager = LinearLayoutManager(this)
         b.listEpisodes.adapter = adapter
+        val extras = ExtrasView(this)
+        adapter.footer = extras
 
         b.progress.visibility = View.VISIBLE
         lifecycleScope.launch {
             try {
-                val episodes = XtreamApi.seriesInfo(service, account, seriesId)
+                val data = XtreamApi.seriesFull(service, account, seriesId)
+                val episodes = data.episodes
+                bindDetails(data.details)
                 b.progress.visibility = View.GONE
                 if (episodes.isEmpty()) {
                     b.txtError.text = getString(R.string.no_episodes)
@@ -65,6 +69,7 @@ class SeriesActivity : AppCompatActivity() {
                 } else {
                     this@SeriesActivity.episodes = episodes
                     adapter.submit(episodes)
+                    loadExtras(extras, account, data.details?.genre, seriesId)
                     b.btnDownloadAll.visibility = View.VISIBLE
                     b.listEpisodes.post { b.listEpisodes.getChildAt(0)?.findViewById<View>(R.id.row)?.requestFocus() }
                 }
@@ -74,6 +79,35 @@ class SeriesActivity : AppCompatActivity() {
                 b.txtError.visibility = View.VISIBLE
             }
         }
+    }
+
+    /** Actor photos and similar shows (from TMDB), matched to what this provider actually has. */
+    private fun loadExtras(extras: ExtrasView, account: com.mediahere.tv.data.Account, genre: String?, seriesId: String) {
+        lifecycleScope.launch {
+            val title = b.txtTitle.text.toString()
+            val info = com.mediahere.tv.data.Tmdb.lookup(title, null, series = true)
+            extras.showCast(info.cast)
+            val catalogue = try { com.mediahere.tv.data.CatalogCache.get(this@SeriesActivity, service, account, com.mediahere.tv.data.ContentKind.SERIES) } catch (_: Exception) { emptyList() }
+            val similar = com.mediahere.tv.data.Tmdb.similarIn(info, catalogue, seriesId, title)
+            extras.showSimilar(similar) { s ->
+                s.id?.let { startActivity(intent(this@SeriesActivity, service, it, s.name.orEmpty(), s.image, s.plot)) }
+            }
+            adapter.notifyDataSetChanged()
+        }
+    }
+
+    /** Rating, genre, cast and trailer from the provider, when it has them. */
+    private fun bindDetails(d: com.mediahere.tv.data.Details?) {
+        d ?: return
+        val facts = listOfNotNull(
+            d.year,
+            d.rating?.toDoubleOrNull()?.takeIf { it > 0 }?.let { "★ " + String.format("%.1f", it) },
+            d.genre
+        )
+        if (facts.isNotEmpty()) { b.txtFacts.text = facts.joinToString("  ·  "); b.txtFacts.visibility = View.VISIBLE }
+        if (b.txtPlot.text.isNullOrBlank() && !d.plot.isNullOrBlank()) b.txtPlot.text = d.plot
+        d.cast?.let { b.txtCast.text = getString(R.string.cast_fmt, it); b.txtCast.visibility = View.VISIBLE }
+        d.trailerUrl?.let { url -> b.btnTrailer.visibility = View.VISIBLE; b.btnTrailer.setOnClickListener { openTrailer(this, url) } }
     }
 
     private fun item(ep: Episode): DownloadItem? {
@@ -168,19 +202,27 @@ class SeriesActivity : AppCompatActivity() {
         startActivity(PlayerActivity.intent(this, url, title, false, WatchProgress.episodeKey(ep.id)))
     }
 
-    private class EpisodeAdapter(val onClick: (Episode) -> Unit, val onLongClick: (Episode) -> Unit, val onSeason: (Int) -> Unit) : RecyclerView.Adapter<EpisodeAdapter.VH>() {
+    private class EpisodeAdapter(val onClick: (Episode) -> Unit, val onLongClick: (Episode) -> Unit, val onSeason: (Int) -> Unit) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
         private var items: List<Episode> = emptyList()
+        /** Cast and similar titles, shown after the last episode. */
+        var footer: View? = null
 
         class VH(val vb: ItemEpisodeBinding) : RecyclerView.ViewHolder(vb.root)
+        class FooterVH(v: View) : RecyclerView.ViewHolder(v)
 
         fun submit(list: List<Episode>) { items = list; notifyDataSetChanged() }
 
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH =
-            VH(ItemEpisodeBinding.inflate(LayoutInflater.from(parent.context), parent, false))
+        override fun getItemViewType(position: Int) = if (position >= items.size) 1 else 0
 
-        override fun getItemCount() = items.size
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder =
+            if (viewType == 1) FooterVH(footer!!.also { (it.parent as? ViewGroup)?.removeView(it) })
+            else VH(ItemEpisodeBinding.inflate(LayoutInflater.from(parent.context), parent, false))
 
-        override fun onBindViewHolder(holder: VH, position: Int) {
+        override fun getItemCount() = items.size + if (footer != null && items.isNotEmpty()) 1 else 0
+
+        override fun onBindViewHolder(viewHolder: RecyclerView.ViewHolder, position: Int) {
+            if (viewHolder !is VH) return
+            val holder = viewHolder
             val ep = items[position]
             val ctx = holder.vb.root.context
             val firstOfSeason = position == 0 || items[position - 1].season != ep.season

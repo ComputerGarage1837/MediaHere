@@ -39,6 +39,16 @@ public partial class PlayerPage : AppPage
     private string _url;
     private string _title;
     private readonly bool _isLive;
+    /// Channel up / down is available (opened from the guide with its channel list).
+    private readonly bool _zap;
+    private readonly bool _fromGuide;
+    private long _nowCheckedAt;
+    private bool _nowFetching;
+    /// The other stream format (HLS / TS) was already tried for this channel.
+    private bool _triedAlternate;
+    /// Play the plain stream instead of the storage buffer (used when the buffered TS stream failed).
+    private bool _noTimeshift;
+    private bool _audioApplied;
     /// Progress key for movies, episodes and downloads; null for live TV.
     private string? _watchKey;
     private bool _resumeAsked;
@@ -83,10 +93,12 @@ public partial class PlayerPage : AppPage
     private bool _controlsVisible = true;
     private bool _dead;
 
-    public PlayerPage(string url, string title, bool live, string? watchKey = null)
+    public PlayerPage(string url, string title, bool live, string? watchKey = null, bool zap = false)
     {
         InitializeComponent();
         _url = url; _title = title; _isLive = live;
+        _zap = live && zap && ChannelQueue.Available;
+        _fromGuide = live && zap;
         _watchKey = live ? null : watchKey;
         AppLog.I(TAG, $"open live={live} title='{title}' url={AppLog.SafeUrl(url)}");
         TxtTitle.Text = title;
@@ -97,7 +109,10 @@ public partial class PlayerPage : AppPage
         BtnRetry.Click += (_, _) => { _retries = 0; _nudges = 0; ReleasePlayer(); InitPlayer(); };
         BtnNextCancel.Click += (_, _) => HideNext();
         BtnPlay.Click += (_, _) => TogglePause();
-        BtnCc.Click += (_, _) => PickSubtitles();
+        BtnCc.Click += (_, _) => PickTracks();
+        BtnChUp.Click += (_, _) => ZapBy(1);
+        BtnChDown.Click += (_, _) => ZapBy(-1);
+        BtnMini.Click += (_, _) => App.Window?.SetMini(!App.Window.IsMini);
         BtnFull.Click += (_, _) => App.Window?.SetFullScreen(!App.Window.IsFullScreen);
         BtnClose.Click += (_, _) => Finish();
         Seek.PreviewMouseDown += (_, _) => _seekDragging = true;
@@ -155,6 +170,7 @@ public partial class PlayerPage : AppPage
     public override void OnDestroy()
     {
         _dead = true;
+        try { if (App.Window?.IsMini == true) App.Window.SetMini(false); } catch { }
         if (_libVlc != null) _libVlc.Log -= OnVlcLog;
         _libVlc = null;
     }
@@ -181,9 +197,14 @@ public partial class PlayerPage : AppPage
             case Key.MediaStop: Finish(); return true;
             case Key.Space: if (Keyboard.FocusedElement is not System.Windows.Controls.Primitives.ButtonBase) { TogglePause(); return true; } return false;
             case Key.F: App.Window?.SetFullScreen(!App.Window.IsFullScreen); return true;
+            case Key.M: if (Keyboard.FocusedElement is not System.Windows.Controls.TextBox) { App.Window?.SetMini(!App.Window.IsMini); return true; } return false;
             case Key.Left: if (!_controlsVisible) { SeekBy(-SEEK_STEP_MS); return true; } break;
             case Key.Right: if (!_controlsVisible) { SeekBy(SEEK_STEP_MS); return true; } break;
-            case Key.Up: case Key.Down: if (!_controlsVisible) { ShowControls(); return true; } break;
+            case Key.PageUp: if (_zap) { ZapBy(1); return true; } break;
+            case Key.PageDown: if (_zap) { ZapBy(-1); return true; } break;
+            // With the controls hidden, up / down change channel too.
+            case Key.Up: if (_zap && !_controlsVisible) { ZapBy(1); return true; } if (!_controlsVisible) { ShowControls(); return true; } break;
+            case Key.Down: if (_zap && !_controlsVisible) { ZapBy(-1); return true; } if (!_controlsVisible) { ShowControls(); return true; } break;
             case Key.Enter: if (!_controlsVisible) { ShowControls(); return true; } break;
         }
         if (_controlsVisible) ShowControls();   // restart the auto-hide timer
@@ -214,8 +235,8 @@ public partial class PlayerPage : AppPage
         TitleBar.Visibility = v;
         Controller.Visibility = v;
         TxtLiveStatus.Visibility = _isLive ? v : Visibility.Collapsed;
-        BtnSeekBack.Visibility = v;
-        BtnSeekFwd.Visibility = v;
+        ChannelBox.Visibility = _zap ? Visibility.Visible : Visibility.Collapsed;
+        if (on) RefreshNowPlaying(true);
         Overlay.Cursor = on ? Cursors.Arrow : Cursors.None;
     }
 
@@ -320,12 +341,13 @@ public partial class PlayerPage : AppPage
         ErrorBox.Visibility = Visibility.Collapsed;
         BtnRetry.Content = "Retry";
         _pausedTotalMs = 0; _pausedSince = 0; _behindNow = false; _itemFromBytes = 0;
-        _userPaused = false; _ended = false; _lengthMs = 0; _timeMs = 0;
+        _userPaused = false; _ended = false; _lengthMs = 0; _timeMs = 0; _audioApplied = false;
 
         // Storage levels only make sense for live channels; movies and series get the biggest
         // in-memory buffer instead, since they can already be scrubbed freely.
         var chosen = BufferLevel.From(_prefs.BufferLevelKey);
         var level = chosen.OnDisk && !_isLive ? BufferLevel.MAX : chosen;
+        var disk = level.OnDisk && !_noTimeshift;
         AppLog.I(TAG, $"initPlayer level={level.Key} preferSoftware={_preferSoftware} start={_startPositionMs}ms");
 
         try
@@ -354,7 +376,7 @@ public partial class PlayerPage : AppPage
             Video.MediaPlayer = p;
 
             var playUrl = _url;
-            if (_isLive && level.OnDisk)
+            if (_isLive && disk)
             {
                 // Storage timeshift works on the raw MPEG-TS stream; swap an HLS address for it.
                 var tsUrl = Regex.Replace(_url, @"\.m3u8$", ".ts");
@@ -370,7 +392,7 @@ public partial class PlayerPage : AppPage
             media.AddOption(":prefetch-read-size=1048576");
             media.AddOption(":http-user-agent=" + XtreamApi.USER_AGENT);
             media.AddOption(":http-reconnect");
-            if (_isLive && !level.OnDisk) media.AddOption(":clock-jitter=0");
+            if (_isLive && !disk) media.AddOption(":clock-jitter=0");
             if (_startPositionMs > 0) media.AddOption($":start-time={_startPositionMs / 1000.0:0.###}");
             _startPositionMs = 0;
             _media = media;
@@ -511,6 +533,31 @@ public partial class PlayerPage : AppPage
     private void OnTrackAdded(TrackType type)
     {
         if (type == TrackType.Text) ApplySubtitlePreference();
+        else if (type == TrackType.Audio) ApplyAudioPreference();
+    }
+
+    /// The language of a VLC track name such as "Track 1 - [English]" (or the whole name).
+    private static string TrackLanguage(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return "";
+        var m = Regex.Match(name, @"\[(.+?)\]");
+        return (m.Success ? m.Groups[1].Value : name).Trim();
+    }
+
+    /// Picks the audio track in the language the viewer chose last time, once per stream.
+    private void ApplyAudioPreference()
+    {
+        var wanted = _prefs.AudioLanguage;
+        var p = _player;
+        if (p == null || _audioApplied || string.IsNullOrWhiteSpace(wanted)) return;
+        try
+        {
+            var match = p.AudioTrackDescription.FirstOrDefault(t => t.Id != -1 && TrackLanguage(t.Name).Contains(wanted, StringComparison.OrdinalIgnoreCase));
+            if (match.Name == null) return;   // not (yet) among the tracks
+            _audioApplied = true;
+            if (p.AudioTrack != match.Id) p.SetAudioTrack(match.Id);
+        }
+        catch { }
     }
 
     /// Subtitles follow the saved preference; the CC button in the controls changes and remembers it.
@@ -525,26 +572,98 @@ public partial class PlayerPage : AppPage
         catch { }
     }
 
-    private void PickSubtitles()
+    /// Lists the audio and subtitle tracks of the stream; choosing one switches to it and remembers the choice.
+    private void PickTracks()
     {
         var p = _player;
         if (p == null) return;
-        TrackDescription[] tracks;
-        try { tracks = p.SpuDescription; } catch { tracks = Array.Empty<TrackDescription>(); }
-        var real = tracks.Where(t => t.Id != -1).ToList();
-        if (real.Count == 0) { Dialogs.Toast("This title has no subtitle tracks."); ShowControls(); return; }
-        var labels = new List<string> { "Off" };
-        labels.AddRange(real.Select(t => string.IsNullOrWhiteSpace(t.Name) ? $"Track {t.Id}" : t.Name));
-        var current = p.Spu == -1 ? 0 : real.FindIndex(t => t.Id == p.Spu) + 1;
-        var which = Dialogs.SingleChoice("Subtitles", labels, Math.Max(0, current));
-        if (which < 0) { ShowControls(); return; }
-        try
+        TrackDescription[] audio, subs;
+        try { audio = p.AudioTrackDescription; } catch { audio = Array.Empty<TrackDescription>(); }
+        try { subs = p.SpuDescription; } catch { subs = Array.Empty<TrackDescription>(); }
+        var audioReal = audio.Where(t => t.Id != -1).ToList();
+        var subReal = subs.Where(t => t.Id != -1).ToList();
+        if (audioReal.Count <= 1 && subReal.Count == 0) { Dialogs.Toast("This stream has no other audio or subtitle tracks to choose."); ShowControls(); return; }
+        var labels = new List<string>();
+        var actions = new List<Action>();
+        var currentAudio = p.AudioTrack;
+        for (var i = 0; i < audioReal.Count; i++)
         {
-            if (which == 0) { p.SetSpu(-1); _prefs.Subtitles = false; }
-            else { p.SetSpu(real[which - 1].Id); _prefs.Subtitles = true; }
+            var t = audioReal[i];
+            var name = string.IsNullOrWhiteSpace(t.Name) ? $"Track {i + 1}" : t.Name;
+            labels.Add((t.Id == currentAudio ? "✓ " : "") + "Audio: " + name);
+            actions.Add(() =>
+            {
+                p.SetAudioTrack(t.Id);
+                var lang = TrackLanguage(t.Name);
+                if (!string.IsNullOrWhiteSpace(lang) && !lang.StartsWith("Track", StringComparison.OrdinalIgnoreCase)) _prefs.AudioLanguage = lang;
+            });
         }
-        catch { }
+        var currentSpu = p.Spu;
+        foreach (var t in subReal)
+        {
+            var name = string.IsNullOrWhiteSpace(t.Name) ? $"Track {t.Id}" : t.Name;
+            labels.Add((t.Id == currentSpu ? "✓ " : "") + "Subtitles: " + name);
+            actions.Add(() => { p.SetSpu(t.Id); _prefs.Subtitles = true; });
+        }
+        if (subReal.Count > 0)
+        {
+            labels.Add((currentSpu == -1 ? "✓ " : "") + "Subtitles: off");
+            actions.Add(() => { p.SetSpu(-1); _prefs.Subtitles = false; });
+        }
+        var which = Dialogs.Items("Audio and subtitles", labels);
+        if (which >= 0 && which < actions.Count)
+        {
+            try { actions[which](); } catch { }
+        }
         ShowControls();
+    }
+
+    // ---- Channel up / down -----------------------------------------------------------
+
+    private void ZapBy(int delta)
+    {
+        var s = ChannelQueue.Step(delta);
+        var svc = ChannelQueue.Service;
+        if (s == null || svc == null) return;
+        var acct = _prefs.Account(svc.Value);
+        if (acct == null) return;
+        string url;
+        try { url = XtreamApi.StreamUrl(svc.Value, acct, s, _prefs.LiveFormat, true); } catch { return; }
+        AppLog.I(TAG, $"channel {(delta > 0 ? "up" : "down")} -> '{s.Name}'");
+        _url = url;
+        _title = s.Name ?? "";
+        TxtTitle.Text = _title;
+        TxtNow.Visibility = Visibility.Collapsed;
+        _nowCheckedAt = 0;
+        RefreshNowPlaying(true);
+        _retries = 0; _nudges = 0; _triedAlternate = false; _noTimeshift = false;
+        CancelRetry();
+        ReleasePlayer();
+        InitPlayer();
+        ShowControls();   // brings up the title so the new channel is named
+    }
+
+    /// Some channels only work as HLS and some only as raw TS. When one fails, quietly try the other once
+    /// before showing an error. With a storage buffer (always TS through the relay) the other format is the
+    /// plain HLS stream.
+    private bool TryAlternateFormat()
+    {
+        if (_triedAlternate) return false;
+        var baseUrl = Regex.Replace(_url, @"\.(m3u8|ts)$", "");
+        if (baseUrl == _url) return false;
+        var onDisk = BufferLevel.From(_prefs.BufferLevelKey).OnDisk && !_noTimeshift;
+        string newUrl;
+        if (onDisk) { _noTimeshift = true; newUrl = baseUrl + ".m3u8"; }
+        else newUrl = _url.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase) ? baseUrl + ".ts" : baseUrl + ".m3u8";
+        _triedAlternate = true;
+        AppLog.W(TAG, $"format fallback: {AppLog.SafeUrl(_url)} -> {AppLog.SafeUrl(newUrl)}");
+        Dialogs.Toast("Trying another stream format…");
+        _url = newUrl;
+        _retries = 0; _nudges = 0;
+        CancelRetry();
+        ReleasePlayer();
+        InitPlayer();
+        return true;
     }
 
     // ---- Watchdog, progress, release -----------------------------------------------
@@ -730,18 +849,22 @@ public partial class PlayerPage : AppPage
         var why = _lastLoadError;
         AppLog.E(TAG, $"player error: {why ?? "unknown"}");
         var providerRefused = why != null && why.Contains("HTTP", StringComparison.Ordinal) && !why.Contains("timed out", StringComparison.Ordinal);
-        if (_isLive && !providerRefused && _retries < MAX_RETRIES)
+        // "Too many connections" often just means the previous stream (a guide preview, say) is still
+        // closing on the provider's side, so give it a few seconds and try again before giving up.
+        var busy = _isLive && why != null && (why.Contains("HTTP 403") || why.Contains("HTTP 429") || why.Contains("HTTP 458") || why.Contains("HTTP 509"));
+        if (_isLive && (!providerRefused || busy) && _retries < (busy ? 3 : MAX_RETRIES))
         {
             _retries++;
-            var delay = 1000 * _retries;
+            var delay = (busy ? 2500 : 1000) * _retries;
             BufferBox.Visibility = Visibility.Visible;
-            TxtBuffer.Text = $"Reconnecting… ({_retries} of {MAX_RETRIES})";
+            TxtBuffer.Text = busy ? $"The provider is still closing the previous stream… retrying ({_retries} of 3)" : $"Reconnecting… ({_retries} of {MAX_RETRIES})";
             _pendingRetry = true;
             _retryTimer.Interval = TimeSpan.FromMilliseconds(delay);
             _retryTimer.Stop();
             _retryTimer.Start();
             return;
         }
+        if (_isLive && TryAlternateFormat()) return;
         BufferBox.Visibility = Visibility.Collapsed;
         ShowFailure(why ?? "Playback failed: the stream could not be opened.");
     }
@@ -804,6 +927,7 @@ public partial class PlayerPage : AppPage
         TxtTime.Text = len > 0 ? $"{Clock(time)} / {Clock(len)}" : (_isLive ? Clock(time) : "");
 
         if (!_isLive) return;
+        if (_controlsVisible) RefreshNowPlaying(false);
         var behindMs = BehindLiveMs(p);
         var paused = _userPaused;
         _behindNow = paused || behindMs >= BEHIND_THRESHOLD_MS;
@@ -811,6 +935,50 @@ public partial class PlayerPage : AppPage
             : _behindNow ? $"{Clock(behindMs)} behind live · select to go live"
             : "● LIVE";
         Ui.SetSelected(TxtLiveStatus, _behindNow);
+    }
+
+    /// Live TV and 24/7 channels opened from the guide: what is on now and what is next, under the title.
+    private void RefreshNowPlaying(bool force)
+    {
+        if (!_fromGuide) return;
+        var s = ChannelQueue.Current;
+        var svc = ChannelQueue.Service;
+        if (s == null || svc == null) { TxtNow.Visibility = Visibility.Collapsed; return; }
+        var nowMs = Format.NowMs;
+        if (!force && nowMs - _nowCheckedAt < 20_000) return;
+        _nowCheckedAt = nowMs;
+        var list = EpgCache.GuideFor(svc.Value, s.EpgChannelId, s.Name)
+                   ?? (s.StreamId != null ? EpgCache.Peek(svc.Value, s.StreamId) : null);
+        if (list != null) { ShowNowPlaying(list); return; }
+        if (_nowFetching || s.StreamId == null) return;
+        var acct = _prefs.Account(svc.Value);
+        if (acct == null) return;
+        _nowFetching = true;
+        var sid = s.StreamId;
+        var service = svc.Value;
+        _ = Task.Run(async () =>
+        {
+            List<EpgProgramme> l;
+            try { l = await EpgCache.Get(service, acct, sid); } catch { l = new(); }
+            Ui.Post(() =>
+            {
+                _nowFetching = false;
+                if (!_dead && ChannelQueue.Current?.StreamId == sid) ShowNowPlaying(l);
+            });
+        });
+    }
+
+    private void ShowNowPlaying(List<EpgProgramme> list)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var ordered = list.OrderBy(p => p.Start).ToList();
+        var cur = ordered.FirstOrDefault(p => p.Start <= now && now < p.End);
+        var next = ordered.FirstOrDefault(p => p.Start >= (cur?.End ?? now));
+        var lines = new List<string>();
+        if (cur != null) lines.Add($"Now: {cur.Title}  ·  {Format.TimeRange(cur.Start, cur.End)}");
+        if (next != null) lines.Add($"Next: {next.Title}  ·  {Format.Time(next.Start)}");
+        TxtNow.Text = string.Join("\n", lines);
+        TxtNow.Visibility = lines.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private long BehindLiveMs(MediaPlayer p)

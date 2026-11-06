@@ -99,6 +99,26 @@ public sealed class Prefs
         }
     }
 
+    /// Silent weekly backup of everything (settings, users and their lists, watched positions, sign-ins) into
+    /// %LocalAppData%\MediaHere\backups. Only the newest file is kept, so it never grows.
+    public static void AutoBackupIfDue()
+    {
+        try
+        {
+            var dir = Path.Combine(AppPaths.Data, "backups");
+            Directory.CreateDirectory(dir);
+            var existing = new DirectoryInfo(dir).GetFiles("stream-arc-tv-auto-backup-*.json");
+            var newest = existing.OrderByDescending(f => f.LastWriteTimeUtc).FirstOrDefault();
+            if (newest != null && DateTime.UtcNow - newest.LastWriteTimeUtc < TimeSpan.FromDays(7)) return;
+            var file = Path.Combine(dir, $"stream-arc-tv-auto-backup-{DateTime.Now:yyyy-MM-dd}.json");
+            var tmp = Path.Combine(dir, "auto-backup.tmp");
+            System.IO.File.WriteAllText(tmp, Export());
+            System.IO.File.Move(tmp, file, true);
+            foreach (var f in existing) if (!string.Equals(f.FullName, file, StringComparison.OrdinalIgnoreCase)) { try { f.Delete(); } catch { } }
+        }
+        catch (Exception e) { AppLog.W("Backup", "weekly backup failed: " + e.Message); }
+    }
+
     /// Replaces the stored data with a backup. Throws with a readable message when the file is
     /// not one. The caller restarts the app so every screen and cache reloads.
     public static void Import(string json)
@@ -119,6 +139,7 @@ public sealed class Prefs
             _dirty = true;
         }
         Flush();
+        VodUsers.Reload();   // users, their lists and watched positions come with the file
     }
 
     // ---- Typed accessors -------------------------------------------------
@@ -232,9 +253,17 @@ public sealed class Prefs
     public long GuideSize(Service s) => GetLong(K(s, "guide_size"), 0);
     public void SetGuideSize(Service s, long bytes) => PutLong(K(s, "guide_size"), bytes);
 
+    /// Until this time (epoch ms) per-channel programme lookups are skipped: the panel answered empty for every channel asked.
+    public long ShortEpgOffUntil(Service s) => GetLong(K(s, "short_epg_off_until"), 0);
+    public void SetShortEpgOffUntil(Service s, long until) => PutLong(K(s, "short_epg_off_until"), until);
+
     // ---- Favorites -----------------------------------------------------
 
-    private static string FavKey(Service s, ContentKind kind) => K(s, $"favs_{kind.ToString().ToLowerInvariant()}");
+    private static string FavKey(Service s, ContentKind kind)
+    {
+        var k = K(s, $"favs_{kind.ToString().ToLowerInvariant()}");
+        return s == Service.VOD ? VodUsers.Scope(k) : k;
+    }
 
     public HashSet<string> Favorites(Service s, ContentKind kind) => GetSet(FavKey(s, kind));
 
@@ -251,6 +280,35 @@ public sealed class Prefs
     }
 
     // ---- Updates -------------------------------------------------------
+
+    /// The VOD account offers 24/7 live channels (found by asking its panel); controls the entry on the VOD home.
+    public bool VodChannelsAvailable { get => GetBool("vod_channels_available", false); set => PutBool("vod_channels_available", value); }
+
+    /// Reminders and alerts: subscription expiry and new episodes of My List shows.
+    public bool RemindersOn { get => GetBool("reminders", true); set => PutBool("reminders", value); }
+    public bool NewEpisodeAlerts { get => GetBool("new_episode_alerts", GetBool("reminders", true)); set => PutBool("new_episode_alerts", value); }
+    /// Download new episodes of My List shows by themselves, overnight.
+    public bool AutoDownloadNew { get => GetBool("auto_download_new", false); set => PutBool("auto_download_new", value); }
+    /// "<expiry epoch seconds>:<stage>" of the last expiry reminder sent for a service.
+    public string? ExpiryNotified(Service s) => GetString(K(s, "expiry_notified"));
+    public void SetExpiryNotified(Service s, string value) => PutString(K(s, "expiry_notified"), value);
+    /// Newest episode (season * 10000 + number) seen so far for each My List show, by series id.
+    public Dictionary<string, int> KnownEpisodes()
+    {
+        var d = new Dictionary<string, int>();
+        foreach (var e in (GetString(VodUsers.Scope("known_episodes")) ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var p = e.Split('=');
+            if (p.Length == 2 && int.TryParse(p[1], out var v)) d[p[0]] = v;
+        }
+        return d;
+    }
+    public void SetKnownEpisodes(Dictionary<string, int> map) => PutString(VodUsers.Scope("known_episodes"), string.Join(";", map.Select(kv => $"{kv.Key}={kv.Value}")));
+    /// New episodes waiting to be downloaded (tab separated lines, see Reminders).
+    public HashSet<string> PendingEpisodes { get => GetSet("pending_episodes"); set => PutSet("pending_episodes", value); }
+
+    /// How the movie and show lists are ordered: default, newest, rating, year or name.
+    public string VodSort { get => GetString(VodUsers.Scope("vod_sort")) ?? "default"; set => PutString(VodUsers.Scope("vod_sort"), value); }
 
     public string? SkippedVersion { get => GetString("skipped_version"); set => PutString("skipped_version", value); }
     public bool AutoCheckUpdates { get => GetBool("auto_check_updates", true); set => PutBool("auto_check_updates", value); }
@@ -272,6 +330,8 @@ public sealed class Prefs
 
     /// Whether subtitle tracks are shown by default (the player's CC button changes and remembers this).
     public bool Subtitles { get => GetBool("subtitles", false); set => PutBool("subtitles", value); }
+    /// The language of the audio track the viewer last chose (e.g. "English"); preferred on every stream from then on.
+    public string? AudioLanguage { get => GetString("audio_language"); set => PutString("audio_language", value); }
 
     /// Start the next episode automatically when one ends.
     public bool AutoPlayNext { get => GetBool("auto_play_next", true); set => PutBool("auto_play_next", value); }
@@ -306,6 +366,10 @@ public sealed class Prefs
 
     /// Main window placement, so the app opens where it was left.
     public string? WindowPlacement { get => GetString("window_placement"); set => PutString("window_placement", value); }
+
+    /// Raw string access for VodUsers.
+    public static string? RawGet(string key) => GetString(key);
+    public static void RawPut(string key, string? value) => PutString(key, value);
 
     /// Generic JSON blob storage used by WatchProgress and TransferStore (kept in separate files on Android).
     public static string? Blob(string name) => GetString("blob_" + name);

@@ -56,6 +56,12 @@ class BrowseActivity : AppCompatActivity() {
     /** What is being browsed: LIVE for the guide, MOVIE or SERIES for the VOD tabs. */
     private var kind: ContentKind = ContentKind.LIVE
     private val isLive: Boolean get() = kind == ContentKind.LIVE
+    /** The channels currently listed in the guide (after filters), used for channel up / down in the player. */
+    private var visibleStreams: List<Stream> = emptyList()
+    /** Genre the movie / show list is narrowed to, or null for all. */
+    private var genreFilter: String? = null
+    /** The live guide running on the VOD account: the provider's 24/7 channels. */
+    private val twentyFourSeven: Boolean get() = isLive && service.kind != ContentKind.LIVE
 
     private val picker = FolderPicker(this)
     private val categoryAdapter = CategoryAdapter { cat -> selectCategory(cat) }
@@ -92,16 +98,18 @@ class BrowseActivity : AppCompatActivity() {
         pendingCategory = intent.getStringExtra(EXTRA_CATEGORY)
         if (intent.getBooleanExtra(EXTRA_SEARCH, false)) b.inputSearch.post { b.inputSearch.requestFocus() }
 
-        b.txtTitle.text = if (isLive) getString(R.string.tv_guide) else service.title
+        b.txtTitle.text = if (twentyFourSeven) getString(R.string.channels_247_title) else if (isLive) getString(R.string.tv_guide) else service.title
         b.btnBack.setOnClickListener { finish() }
         b.btnProfile.setOnClickListener { startActivity(ProfileActivity.intent(this, service)) }
-        b.btnMulti.visibility = if (isLive) View.VISIBLE else View.GONE
+        b.btnMulti.visibility = if (isLive && !twentyFourSeven) View.VISIBLE else View.GONE
         b.btnRefreshGuide.visibility = if (isLive) View.VISIBLE else View.GONE
+        b.btnSort.visibility = if (isLive) View.GONE else View.VISIBLE
+        b.btnSort.setOnClickListener { showSortFilter() }
         b.btnMulti.setOnClickListener { startActivity(MultiViewActivity.intent(this, service)) }
 
         applyCategoryLayout()
 
-        if (service.kind != ContentKind.LIVE) {
+        if (service.kind != ContentKind.LIVE && !isLive) {
             b.btnTabMovies.setOnClickListener { switchKind(ContentKind.MOVIE) }
             b.btnTabSeries.setOnClickListener { switchKind(ContentKind.SERIES) }
             b.btnTabDownloads.setOnClickListener { startActivity(TransfersActivity.intent(this, com.mediahere.tv.transfer.TransferType.DOWNLOAD)) }
@@ -176,7 +184,7 @@ class BrowseActivity : AppCompatActivity() {
     }
 
     private fun startPreview(stream: Stream) {
-        val url = try { XtreamApi.streamUrl(service, account, stream, prefs.liveFormat) } catch (_: Exception) { return }
+        val url = try { XtreamApi.streamUrl(service, account, stream, prefs.liveFormat, isLive) } catch (_: Exception) { return }
         previewStream = stream
         val player = preview ?: buildPreviewPlayer().also { preview = it }
         b.previewPlayer.player = player
@@ -291,7 +299,10 @@ class BrowseActivity : AppCompatActivity() {
         b.panelEpg.setPadding(b.panelEpg.paddingLeft, pad, b.panelEpg.paddingRight, pad)
         b.listCategories.adapter = null
         b.listCategoriesTop.adapter = null
-        if (compact) {
+        b.epgGrid.wideNames = twentyFourSeven
+        if (twentyFourSeven) {
+            applyRailLayout(compact)
+        } else if (compact) {
             b.listCategories.visibility = View.GONE
             b.listCategoriesTop.visibility = View.VISIBLE
             b.listCategoriesTop.layoutManager = LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false)
@@ -308,9 +319,123 @@ class BrowseActivity : AppCompatActivity() {
         }
     }
 
+    // ---- Sort and filter (movies and shows) ------------------------------------------
+
+    private fun yearOf(s: Stream): Int = Regex("\\b(19|20)\\d{2}\\b").findAll(s.name.orEmpty()).lastOrNull()?.value?.toIntOrNull() ?: 0
+
+    private fun sorted(list: List<Stream>): List<Stream> = when (prefs.vodSort) {
+        "newest" -> list.sortedByDescending { it.added?.trim()?.toLongOrNull() ?: 0L }
+        "rating" -> list.sortedByDescending { it.rating?.trim()?.toDoubleOrNull() ?: 0.0 }
+        "year" -> list.sortedByDescending { yearOf(it) }
+        "name" -> list.sortedBy { it.name.orEmpty().lowercase() }
+        else -> list
+    }
+
+    private fun showSortFilter() {
+        val sorts = listOf(
+            "default" to R.string.sort_default, "newest" to R.string.sort_newest, "rating" to R.string.sort_rating,
+            "year" to R.string.sort_year, "name" to R.string.sort_name
+        )
+        val options = ArrayList<String>()
+        for ((key, label) in sorts) options.add((if (prefs.vodSort == key) "✓ " else "") + getString(R.string.sort_fmt, getString(label)))
+        options.add(getString(R.string.filter_genre_fmt, genreFilter ?: getString(R.string.filter_all_genres)))
+        FocusDialog(this)
+            .setTitle(R.string.sort_filter)
+            .setItems(options.toTypedArray()) { _, which ->
+                if (which < sorts.size) { prefs.vodSort = sorts[which].first; applyFilter() } else pickGenre()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun pickGenre() {
+        val counts = HashMap<String, Int>()
+        for (s in allStreams) for (g in s.genres) counts[g.lowercase()] = (counts[g.lowercase()] ?: 0) + 1
+        val names = counts.entries.sortedByDescending { it.value }.take(40).map { it.key.replaceFirstChar { c -> c.titlecase() } }
+        val options = listOf(getString(R.string.filter_all_genres)) + names
+        FocusDialog(this)
+            .setTitle(R.string.sort_filter)
+            .setItems(options.toTypedArray()) { _, which ->
+                genreFilter = if (which == 0) null else names[which - 1]
+                applyFilter()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    // ---- Static VOD menu (24/7 channels) ------------------------------------------
+
+    private class RailEntry(val label: Int, val icon: Int, val selected: Boolean, val go: () -> Unit)
+
+    /** The same menu as the Video on Demand home, so it doesn't change when opening 24/7 channels. */
+    private fun railEntries(): List<RailEntry> = listOf(
+        RailEntry(R.string.nav_home, R.drawable.img_nav_home, false) { finish() },
+        RailEntry(R.string.nav_search, R.drawable.img_nav_search, false) {
+            startActivity(BrowseActivity.intent(this, service, ContentKind.MOVIE, search = true)); finish()
+        },
+        RailEntry(R.string.categories, R.drawable.ic_vod, false) { startActivity(BrowseActivity.intent(this, service, ContentKind.MOVIE)); finish() },
+        RailEntry(R.string.nav_channels_247, R.drawable.ic_live, true) { },
+        RailEntry(R.string.nav_downloads, R.drawable.img_nav_downloads, false) {
+            startActivity(TransfersActivity.intent(this, com.mediahere.tv.transfer.TransferType.DOWNLOAD))
+        },
+        RailEntry(R.string.nav_profile, R.drawable.img_nav_profile, false) { startActivity(ProfileActivity.intent(this, service)) }
+    )
+
+    private fun bindRailEntry(root: View, e: RailEntry) {
+        root.findViewById<android.widget.ImageView>(R.id.imgIcon).setImageResource(e.icon)
+        root.findViewById<android.widget.TextView>(R.id.txtLabel).setText(e.label)
+        root.isSelected = e.selected
+        root.setOnClickListener { e.go() }
+    }
+
+    /**
+     * 24/7 channels: the VOD menu takes the left column (a row under the header on phones held upright)
+     * and the categories (Favorites, 24/7) become a chip row above the guide.
+     */
+    private fun applyRailLayout(compact: Boolean) {
+        val d = resources.displayMetrics.density
+        val rail = b.listCategories.layoutParams as androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
+        val chips = b.listCategoriesTop.layoutParams as androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
+        val unset = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+        categoryAdapter.chips = true
+        b.listCategoriesTop.visibility = View.VISIBLE
+        b.listCategoriesTop.layoutManager = LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false)
+        b.listCategoriesTop.adapter = categoryAdapter
+        if (compact) {
+            rail.topToBottom = b.listCategoriesTop.id
+            chips.startToEnd = unset; chips.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
+            b.listCategories.visibility = View.GONE
+            b.tabsRow.removeAllViews()
+            for (e in railEntries()) {
+                val v = LayoutInflater.from(this).inflate(R.layout.item_nav_entry, b.tabsRow, false)
+                v.layoutParams = android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                bindRailEntry(v, e)
+                b.tabsRow.addView(v)
+            }
+            b.tabsRow.visibility = View.VISIBLE
+        } else {
+            // The menu runs the full height on the left; the chips sit above the guide, to its right.
+            rail.topToBottom = b.tabsRow.id
+            chips.startToStart = unset; chips.startToEnd = b.listCategories.id
+            b.tabsRow.visibility = View.GONE
+            b.listCategories.visibility = View.VISIBLE
+            b.listCategories.layoutParams = rail.apply { width = (96 * d).toInt() }
+            b.listCategories.layoutManager = LinearLayoutManager(this)
+            val entries = railEntries()
+            b.listCategories.adapter = object : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+                override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
+                    object : RecyclerView.ViewHolder(LayoutInflater.from(parent.context).inflate(R.layout.item_nav_entry, parent, false)) {}
+                override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) = bindRailEntry(holder.itemView, entries[position])
+                override fun getItemCount() = entries.size
+            }
+        }
+        b.listCategories.layoutParams = rail
+        b.listCategoriesTop.layoutParams = chips
+    }
+
     /** Tabs live in the top bar on wide screens and on their own full-width row on portrait phones. */
     private fun placeTabs(compact: Boolean) {
-        val showTabs = service.kind != ContentKind.LIVE
+        val showTabs = service.kind != ContentKind.LIVE && !isLive
         val buttons = listOf(b.btnTabMovies, b.btnTabSeries, b.btnTabDownloads)
         val target: ViewGroup = if (compact) b.tabsRow else b.tabs
         for (btn in buttons) {
@@ -327,7 +452,7 @@ class BrowseActivity : AppCompatActivity() {
         b.tabs.visibility = if (showTabs && !compact) View.VISIBLE else View.GONE
         b.tabsRow.visibility = if (showTabs && compact) View.VISIBLE else View.GONE
         // The chip row already shows the category; the top-bar label is dropped on phones.
-        b.txtCategory.visibility = if (compact) View.GONE else View.VISIBLE
+        b.txtCategory.visibility = if (compact || twentyFourSeven) View.GONE else View.VISIBLE
     }
 
     /** Rotation is handled in place (see the manifest) so the category and guide position survive. */
@@ -366,12 +491,20 @@ class BrowseActivity : AppCompatActivity() {
         lifecycleScope.launch {
             try {
                 val fetched = XtreamApi.categories(service, account, kind)
-                val cats = if (isLive) fetched.filter { it.id !in prefs.hiddenLiveCategories } else fetched
+                // Hidden categories and channels are the Live TV account's choices; they don't apply to 24/7 channels.
+                // 24/7 channels: only the provider's "24/7" categories (not e.g. its Movies group); with no such name, everything.
+                val only247 = if (twentyFourSeven) fetched.filter { it.name?.contains("24/7") == true } else emptyList()
+                val cats = when {
+                    twentyFourSeven -> only247.ifEmpty { fetched }
+                    isLive -> fetched.filter { it.id !in prefs.hiddenLiveCategories }
+                    else -> fetched
+                }
                 providerCategories = cats
                 // With the catalogue already on disk the genre / extra groups are known now;
                 // otherwise they are added as soon as it arrives (see augmentCategories).
                 val cached = if (isLive) null else CatalogCache.peek(service, kind)
                 val all = when {
+                    twentyFourSeven && only247.isNotEmpty() -> listOf(Category(FAV_ID, "★ " + getString(R.string.favorites))) + cats
                     isLive -> listOf(
                         Category(FAV_ID, "★ " + getString(R.string.favorites)),
                         Category(null, getString(R.string.all_categories))
@@ -387,7 +520,7 @@ class BrowseActivity : AppCompatActivity() {
                 val wanted = pendingCategory
                 pendingCategory = null
                 if (isLive) {
-                    selectCategory(defaultLiveCategory(all))
+                    selectCategory(if (twentyFourSeven) all[1] else defaultLiveCategory(all))
                 } else if (wanted != null) {
                     // Opened from the VOD home on a particular group (a genre row's "See all", say).
                     selectCategory(all.firstOrNull { it.id == wanted }
@@ -490,13 +623,18 @@ class BrowseActivity : AppCompatActivity() {
         val q = b.inputSearch.text?.toString()?.trim().orEmpty()
         val favs = prefs.favorites(service, kind)
         var list = if (favoritesMode) allStreams.filter { favs.contains(it.id) } else allStreams
-        if (isLive) {
+        if (isLive && !twentyFourSeven) {
             val hidden = prefs.hiddenLiveCategories
             if (hidden.isNotEmpty()) list = list.filter { it.categoryId !in hidden }
             val hiddenChannels = prefs.hiddenLiveChannels
             if (hiddenChannels.isNotEmpty()) list = list.filter { it.id !in hiddenChannels }
         }
         if (q.isNotEmpty()) list = list.filter { it.name?.contains(q, ignoreCase = true) == true }
+        if (!isLive) {
+            genreFilter?.let { g -> list = list.filter { s -> s.genres.any { it.equals(g, ignoreCase = true) } } }
+            list = sorted(list)
+        }
+        visibleStreams = list
 
         if (isLive) {
             b.epgGrid.favorites = favs
@@ -513,20 +651,27 @@ class BrowseActivity : AppCompatActivity() {
 
     // ---- Actions -------------------------------------------------------
 
-    private fun play(stream: Stream) {
+    /** [direct]: play now (the hold-OK menu) instead of opening the movie page. */
+    private fun play(stream: Stream, direct: Boolean = false) {
         if (kind == ContentKind.SERIES) {
             val id = stream.seriesId ?: stream.streamId ?: return
             startActivity(SeriesActivity.intent(this, service, id, stream.name ?: "", stream.image, stream.plot))
             return
         }
+        if (kind == ContentKind.MOVIE && !direct) { startActivity(MovieActivity.intent(this, service, stream)); return }
         val url = try {
-            XtreamApi.streamUrl(service, account, stream, prefs.liveFormat)
+            XtreamApi.streamUrl(service, account, stream, prefs.liveFormat, isLive)
         } catch (e: Exception) {
             showError(e.message ?: getString(R.string.load_failed)); return
         }
         val key = if (kind == ContentKind.MOVIE) stream.streamId?.let { WatchProgress.movieKey(service, it) } else null
         if (key != null) WatchProgress.describe(key, WatchProgress.KIND_MOVIE, stream.name ?: "", stream.image, stream.containerExtension, stream.streamId!!)
-        startActivity(PlayerActivity.intent(this, url, stream.name ?: "", isLive, key))
+        // The preview is a second connection on the same account; many accounts allow only one, so close
+        // it before the full-screen stream connects (it was only released in onStop, after the player had started).
+        if (isLive) releasePreview()
+        // From the guide the player knows the channel (what's on now) and, with a list, can change channel.
+        if (isLive) com.mediahere.tv.player.ChannelQueue.set(service, visibleStreams.ifEmpty { listOf(stream) }, stream) else com.mediahere.tv.player.ChannelQueue.clear()
+        startActivity(PlayerActivity.intent(this, url, stream.name ?: "", isLive, key, isLive))
     }
 
     /** Context menu opened by holding OK / long-pressing an item. */
@@ -543,7 +688,7 @@ class BrowseActivity : AppCompatActivity() {
         val watchKey = if (kind == ContentKind.MOVIE) stream.streamId?.let { WatchProgress.movieKey(service, it) } else null
         val options = arrayListOf(first, favLabel, third)
         if (watchKey != null) options.add(getString(if (WatchProgress.isWatched(watchKey)) R.string.mark_unwatched else R.string.mark_watched))
-        if (kind == ContentKind.LIVE) options.add(getString(R.string.hide_channel))
+        if (kind == ContentKind.LIVE && !twentyFourSeven) options.add(getString(R.string.hide_channel))
         FocusDialog(this)
             .setTitle(stream.name ?: "")
             .setItems(options.toTypedArray()) { _, which ->
@@ -553,7 +698,7 @@ class BrowseActivity : AppCompatActivity() {
                         Toast.makeText(this, getString(R.string.channel_hidden_fmt, stream.name ?: ""), Toast.LENGTH_LONG).show()
                         applyFilter()
                     } else { WatchProgress.setWatched(watchKey!!, !WatchProgress.isWatched(watchKey)); streamAdapter.notifyDataSetChanged() }
-                    0 -> play(stream)
+                    0 -> play(stream, true)
                     1 -> {
                         val nowFav = prefs.toggleFavorite(service, kind, id)
                         val msg = if (nowFav) R.string.added_to_favorites_fmt else R.string.removed_from_favorites_fmt
@@ -605,7 +750,7 @@ class BrowseActivity : AppCompatActivity() {
 
     private fun recordChannel(stream: Stream) {
         // Recordings always use the MPEG-TS stream so the file plays back directly.
-        val url = try { XtreamApi.streamUrl(service, account, stream, "ts") } catch (e: Exception) {
+        val url = try { XtreamApi.streamUrl(service, account, stream, "ts", true) } catch (e: Exception) {
             Toast.makeText(this, e.message, Toast.LENGTH_LONG).show(); return
         }
         TransferDialogs.record(this, picker, stream.name ?: "Channel", url)

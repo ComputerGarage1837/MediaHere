@@ -7,6 +7,7 @@ using System.Windows.Threading;
 using MediaHere.Data;
 using MediaHere.Transfer;
 using MediaHere.Update;
+using MediaHere.Util;
 
 namespace MediaHere.UI;
 
@@ -57,8 +58,11 @@ public partial class VodHomePage : AppPage
         Header.SetCompact(true);
         Header.SettingsButton.Click += (_, _) => Nav.Push(new SettingsPage());
         Header.UpdateButton.Click += (_, _) => UpdateChecker.Check(manual: true);
+        Header.ShowUser(true);
+        Header.UserButton.Click += (_, _) => UserDialogs.Choose(OnUserChanged);
 
         BuildNav();
+        ProbeChannels();
         _heroTicker.Tick += (_, _) =>
         {
             if (_featured.Count > 1)
@@ -72,6 +76,17 @@ public partial class VodHomePage : AppPage
         Loaded += (_, _) => ApplyNavLayout();
         Render();
         Load();
+        // First time in VOD there is no user yet: ask for one straight away. With several, ask who is watching.
+        Loaded += (_, _) => Ui.Post(() => UserDialogs.Ensure(OnUserChanged));
+    }
+
+    /// A different user is watching: show their lists.
+    private void OnUserChanged()
+    {
+        Header.ShowUser(true);
+        _heroIndex = 0;
+        Render();
+        if (_loaded) LoadNextEpisodes();
     }
 
     public override IInputElement? InitialFocus => _navItems.FirstOrDefault().Card;
@@ -97,6 +112,7 @@ public partial class VodHomePage : AppPage
             if (png != null) stack.Children.Add(new Image { Source = new BitmapImage(new Uri($"pack://application:,,,/Assets/{png}")), Width = 22, Height = 22, Stretch = Stretch.Uniform });
             else stack.Children.Add(new System.Windows.Shapes.Path { Data = icon, Fill = new SolidColorBrush(Color.FromRgb(0xCB, 0xD5, 0xE1)), Width = 22, Height = 22, Stretch = Stretch.Uniform });
             var text = new TextBlock { Text = label, FontSize = 13, Margin = new Thickness(0, 4, 0, 0), HorizontalAlignment = HorizontalAlignment.Center,
+                TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center,
                 Foreground = selected ? Ui.Brush("HighlightBrush") : new SolidColorBrush(Color.FromRgb(0xCB, 0xD5, 0xE1)) };
             stack.Children.Add(text);
             var card = new FocusCard { Content = stack, Style = Ui.Res<Style>("VodNavItem"), Selected = selected };
@@ -108,8 +124,33 @@ public partial class VodHomePage : AppPage
         Add("home", "img_nav_home.png", null, "Home", true, () => RowsScroll.ScrollToTop());
         Add("search", "img_nav_search.png", null, "Search", false, () => Nav.Push(new BrowsePage(_service, ContentKind.MOVIE, search: true)));
         Add("categories", null, Ui.Res<Geometry>("IconVod"), "Categories", false, () => Nav.Push(new BrowsePage(_service, ContentKind.MOVIE)));
+        Add("channels", null, Ui.Res<Geometry>("IconLive"), "24/7 Channels", false, () => Nav.Push(new BrowsePage(_service, ContentKind.LIVE)));
+        SetChannelsVisible(_prefs.VodChannelsAvailable);
         Add("downloads", "img_nav_downloads.png", null, "Downloads", false, () => Nav.Push(new TransfersPage(TransferType.DOWNLOAD)));
         Add("profile", "img_nav_profile.png", null, "Profile", false, () => Nav.Push(new ProfilePage(_service)));
+    }
+
+    /// Shows or hides the 24/7 Channels entry (the provider may or may not supply live channels on this account).
+    private void SetChannelsVisible(bool visible)
+    {
+        foreach (var (card, key) in _navItems)
+            if (key == "channels") card.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    /// Asks the VOD panel for live categories; the entry shows only when it has some and hides again when it doesn't.
+    private async void ProbeChannels()
+    {
+        try
+        {
+            var has = (await XtreamApi.Categories(_service, _account, ContentKind.LIVE)).Count > 0;
+            AppLog.I("Vod", $"24/7 channels offered by the panel: {has}");
+            _prefs.VodChannelsAvailable = has;
+            SetChannelsVisible(has);
+        }
+        catch (Exception e)
+        {
+            AppLog.W("Vod", $"24/7 channel probe failed: {e.Message}");   // keep whatever was shown last time
+        }
     }
 
     /// Side rail in landscape, a row of tabs under the header when the window is taller than wide.
@@ -215,6 +256,11 @@ public partial class VodHomePage : AppPage
             if (cont.Count > 0) rows.Add(new RowPlan("Continue watching", cont, null));
             if (next.Count > 0) rows.Add(new RowPlan("Next episodes", next, null));
 
+            var movieByIdEarly = movies.Where(m => m.Id != null).GroupBy(m => m.Id!).ToDictionary(g => g.Key, g => g.First());
+            var seriesByIdEarly = series.Where(s => s.Id != null).GroupBy(s => s.Id!).ToDictionary(g => g.Key, g => g.First());
+            var because = BecauseYouWatched(movies, series, movieByIdEarly, seriesByIdEarly);
+            if (because != null) rows.Add(because);
+
             var movieById = movies.Where(m => m.Id != null).GroupBy(m => m.Id!).ToDictionary(g => g.Key, g => g.First());
             var seriesById = series.Where(s => s.Id != null).GroupBy(s => s.Id!).ToDictionary(g => g.Key, g => g.First());
             var myList = favMovies.Where(movieById.ContainsKey).Select(id => MovieCard(movieById[id]))
@@ -275,6 +321,33 @@ public partial class VodHomePage : AppPage
         return counts.Where(kv => kv.Value >= 5).OrderByDescending(kv => kv.Value).Take(n).Select(kv => kv.Key).ToList();
     }
 
+    /// Titles that share a genre with what was finished most recently, best rated first.
+    private RowPlan? BecauseYouWatched(List<Data.Stream> movies, List<Data.Stream> series,
+        Dictionary<string, Data.Stream> movieById, Dictionary<string, Data.Stream> seriesById)
+    {
+        var last = WatchProgress.LastFinished();
+        if (last == null) return null;
+        var isSeries = last.Kind == WatchProgress.KIND_EPISODE;
+        var seedKey = isSeries ? last.SeriesId : last.ItemId;
+        if (seedKey == null) return null;
+        var seed = isSeries ? (seriesById.TryGetValue(seedKey, out var ss) ? ss : null) : (movieById.TryGetValue(seedKey, out var ms) ? ms : null);
+        if (seed == null) return null;
+        var genres = seed.Genres.Select(g => g.ToLowerInvariant()).ToHashSet();
+        if (genres.Count == 0) return null;
+        var started = WatchProgress.StartedSeries(200).Where(e => e.SeriesId != null).Select(e => e.SeriesId!).ToHashSet();
+        var pool = isSeries ? series : movies;
+        var picks = pool
+            .Where(s => s.Id != seed.Id && !string.IsNullOrWhiteSpace(s.Name))
+            .Where(s => isSeries ? s.Id == null || !started.Contains(s.Id) : !WatchProgress.IsWatched(WatchProgress.MovieKey(_service, s.StreamId ?? "")))
+            .Select(s => (S: s, Shared: s.Genres.Count(g => genres.Contains(g.ToLowerInvariant()))))
+            .Where(x => x.Shared > 0)
+            .OrderByDescending(x => x.Shared)
+            .ThenByDescending(x => double.TryParse(x.S.Rating, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var r) ? r : 0)
+            .Take(20).Select(x => x.S).ToList();
+        if (picks.Count < 4) return null;
+        return new RowPlan($"Because you watched {seed.Name}", picks.Select(p => isSeries ? SeriesCard(p) : MovieCard(p)).ToList(), null);
+    }
+
     private Card MovieCard(Data.Stream s)
     {
         var key = s.StreamId != null ? WatchProgress.MovieKey(_service, s.StreamId) : null;
@@ -283,7 +356,7 @@ public partial class VodHomePage : AppPage
         {
             Title = s.Name ?? "", Subtitle = s.Genres.FirstOrDefault(), Image = s.Image,
             Progress = frac is < 1f ? frac : null, Badge = frac >= 1f ? "✓" : null,
-            OnClick = () => PlayMovie(s),
+            OnClick = () => Nav.Push(new MoviePage(_service, s)),
             OnLongClick = () => ShowMovieMenu(s),
         };
     }
@@ -326,7 +399,7 @@ public partial class VodHomePage : AppPage
         grid.Children.Add(poster);
         var text = new StackPanel { VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(18, 8, 190, 12) };
         text.Children.Add(new TextBlock { Text = "F E A T U R E D", FontSize = 12, FontWeight = FontWeights.SemiBold, Foreground = Ui.Brush("AccentBrush") });
-        var title = new TextBlock { FontSize = 26, FontWeight = FontWeights.Black, Foreground = Ui.Brush("TextBrush"), TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.Wrap, MaxHeight = 66, Margin = new Thickness(0, 4, 0, 0) };
+        var title = new TextBlock { FontSize = 26, FontWeight = FontWeights.Black, Foreground = Ui.Brush("TextBrush"), TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.Wrap, MaxHeight = 104, Margin = new Thickness(0, 4, 0, 0) };
         var meta = new TextBlock { FontSize = 13, Foreground = Ui.Brush("TextMutedBrush"), TextTrimming = TextTrimming.CharacterEllipsis, Margin = new Thickness(0, 4, 0, 0) };
         var plot = new TextBlock { FontSize = 12, Foreground = new SolidColorBrush(Color.FromRgb(0xD0, 0xD8, 0xE4)), TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.Wrap, MaxHeight = 34, Margin = new Thickness(0, 6, 0, 0) };
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
@@ -465,7 +538,7 @@ public partial class VodHomePage : AppPage
         if (c.Progress != null)
             posterGrid.Children.Add(new ProgressBar { Style = Ui.Res<Style>("ThinProgress"), VerticalAlignment = VerticalAlignment.Bottom, Value = c.Progress.Value * 1000 });
         stack.Children.Add(posterGrid);
-        stack.Children.Add(new TextBlock { Text = c.Title, FontSize = 12, Foreground = Ui.Brush("TextBrush"), TextTrimming = TextTrimming.CharacterEllipsis, Margin = new Thickness(0, 6, 0, 0) });
+        stack.Children.Add(new TextBlock { Text = c.Title, FontSize = 12, Foreground = Ui.Brush("TextBrush"), TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.Wrap, MaxHeight = 54, Margin = new Thickness(0, 6, 0, 0) });
         stack.Children.Add(new TextBlock { Text = c.Subtitle ?? "", FontSize = 10.5, Foreground = Ui.Brush("TextMutedBrush"), TextTrimming = TextTrimming.CharacterEllipsis, Visibility = string.IsNullOrWhiteSpace(c.Subtitle) ? Visibility.Hidden : Visibility.Visible });
         LazyImages.Register(img, c.Image, 320);
         var card = new FocusCard { Content = stack, Style = Ui.Res<Style>("StreamItem"), Padding = new Thickness(5) };

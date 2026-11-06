@@ -103,11 +103,17 @@ class VodHomeActivity : AppCompatActivity() {
         b.header.btnSettings.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         b.header.btnUpdate.setOnClickListener { UpdateChecker.check(this, manual = true) }
         b.header.boxGuide.visibility = View.GONE   // the guide belongs to Live TV
+        b.header.boxUser.visibility = View.VISIBLE
+        b.header.btnUser.setOnClickListener { UserDialogs.choose(this) { onUserChanged() } }
+        showUser()
 
         b.navHome.isSelected = true
         b.navHome.setOnClickListener { b.listRows.smoothScrollToPosition(0) }
         b.navSearch.setOnClickListener { startActivity(BrowseActivity.intent(this, service, ContentKind.MOVIE, search = true)) }
         b.navCategories.setOnClickListener { startActivity(BrowseActivity.intent(this, service, ContentKind.MOVIE)) }
+        b.navChannels.setOnClickListener { startActivity(BrowseActivity.intent(this, service, ContentKind.LIVE)) }
+        b.navChannels.visibility = if (prefs.vodChannelsAvailable) View.VISIBLE else View.GONE
+        probeChannels()
         b.navDownloads.setOnClickListener { startActivity(TransfersActivity.intent(this, TransferType.DOWNLOAD)) }
         b.navProfile.setOnClickListener { startActivity(ProfileActivity.intent(this, service)) }
 
@@ -117,6 +123,22 @@ class VodHomeActivity : AppCompatActivity() {
         applyNavLayout()
         render()
         load()
+        // First time in VOD there is no user yet: ask for one straight away. With several, ask who is watching.
+        UserDialogs.ensure(this) { onUserChanged() }
+    }
+
+    private fun showUser() {
+        val u = com.mediahere.tv.data.VodUsers.current() ?: return
+        b.header.btnUser.setImageDrawable(UserDialogs.avatar(u.name, u.color))
+        b.header.txtUserName.text = u.name
+    }
+
+    /** A different user is watching: show their lists. */
+    private fun onUserChanged() {
+        showUser()
+        heroIndex = 0
+        render()
+        if (loaded) loadNextEpisodes()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -162,6 +184,26 @@ class VodHomeActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 if (land) 0f else 1f
             ).apply { bottomMargin = (4 * d).toInt() }
+        }
+    }
+
+    // ---- 24/7 channels ----------------------------------------------------------
+
+    /**
+     * The provider may supply 24/7 live channels on this account. Ask its panel for live
+     * categories; the "24/7" entry shows only when it has some and hides again when it doesn't.
+     */
+    private fun probeChannels() {
+        lifecycleScope.launch {
+            val has = try {
+                XtreamApi.categories(service, account, ContentKind.LIVE).isNotEmpty()
+            } catch (e: Exception) {
+                com.mediahere.tv.util.AppLog.w("Vod", "24/7 channel probe failed: ${e.message}")
+                return@launch   // keep whatever was shown last time
+            }
+            com.mediahere.tv.util.AppLog.i("Vod", "24/7 channels offered by the panel: $has")
+            prefs.vodChannelsAvailable = has
+            b.navChannels.visibility = if (has) View.VISIBLE else View.GONE
         }
     }
 
@@ -233,6 +275,7 @@ class VodHomeActivity : AppCompatActivity() {
 
         val movieById = movies.associateBy { it.id }
         val seriesById = series.associateBy { it.id }
+        becauseYouWatched(movieById, seriesById)?.let { rows.add(it) }
         val myList = prefs.favorites(service, ContentKind.MOVIE).mapNotNull { movieById[it] }.map { movieCard(it) } +
             prefs.favorites(service, ContentKind.SERIES).mapNotNull { seriesById[it] }.map { seriesCard(it) }
         if (myList.isNotEmpty()) rows.add(Row.Cards(getString(R.string.my_list), myList, null))
@@ -259,6 +302,27 @@ class VodHomeActivity : AppCompatActivity() {
         rowsAdapter.submit(rows)
     }
 
+    /** Titles that share a genre with what was finished most recently, best rated first. */
+    private fun becauseYouWatched(movieById: Map<String?, Stream>, seriesById: Map<String?, Stream>): Row.Cards? {
+        val last = WatchProgress.lastFinished() ?: return null
+        val isSeries = last.kind == WatchProgress.KIND_EPISODE
+        val seed = (if (isSeries) seriesById[last.seriesId] else movieById[last.itemId]) ?: return null
+        val genres = seed.genres.map { it.lowercase() }.toSet()
+        if (genres.isEmpty()) return null
+        val startedSeries = WatchProgress.startedSeries(200).mapNotNull { it.seriesId }.toSet()
+        val pool = if (isSeries) series else movies
+        val picks = pool.asSequence()
+            .filter { it.id != seed.id && !it.name.isNullOrBlank() }
+            .filter { if (isSeries) it.id !in startedSeries else !WatchProgress.isWatched(WatchProgress.movieKey(service, it.streamId ?: "")) }
+            .map { s -> s to s.genres.count { it.lowercase() in genres } }
+            .filter { it.second > 0 }
+            .sortedWith(compareByDescending<Pair<Stream, Int>> { it.second }.thenByDescending { it.first.rating?.trim()?.toDoubleOrNull() ?: 0.0 })
+            .take(20).map { it.first }.toList()
+        if (picks.size < 4) return null
+        val cards = picks.map { if (isSeries) seriesCard(it) else movieCard(it) }
+        return Row.Cards(getString(R.string.because_you_watched_fmt, seed.name ?: ""), cards, null)
+    }
+
     private fun topGenres(items: List<Stream>, n: Int): List<String> {
         val counts = HashMap<String, Int>()
         for (s in items) for (g in s.genres) counts[g] = (counts[g] ?: 0) + 1
@@ -271,7 +335,7 @@ class VodHomeActivity : AppCompatActivity() {
         return Card(
             title = s.name ?: "", subtitle = s.genres.firstOrNull(), image = s.image,
             progress = frac?.takeIf { it < 1f }, badge = if (frac != null && frac >= 1f) "✓" else null,
-            onClick = { playMovie(s) },
+            onClick = { startActivity(MovieActivity.intent(this, service, s)) },
             onLongClick = { showMovieMenu(s) },
         )
     }

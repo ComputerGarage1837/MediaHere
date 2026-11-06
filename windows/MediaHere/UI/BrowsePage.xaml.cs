@@ -22,12 +22,17 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
     public const string GENRE_PREFIX = "__genre__:";
     /// Above this, the whole-guide file is not worth downloading; channels are fetched individually.
     private const long FULL_GUIDE_LIMIT = 60L * 1024 * 1024;
+    private const int PREFETCH_LIMIT = 60;
 
     private readonly Service _service;
     private readonly Prefs _prefs = Prefs.Instance;
     private readonly Account _account = null!;
     private ContentKind _kind;
     private bool IsLive => _kind == ContentKind.LIVE;
+    /// The live guide running on the VOD account: the provider's 24/7 channels.
+    private bool TwentyFourSeven => IsLive && _service.Kind() != ContentKind.LIVE;
+    /// Categories are shown as a chip row (narrow windows, and 24/7 channels where the left column is the VOD menu).
+    private bool ChipsMode => _compact || TwentyFourSeven;
 
     private List<Data.Stream> _allStreams = new();
     private readonly Dictionary<string, List<Data.Stream>> _streamCache = new();
@@ -69,13 +74,15 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         _pendingCategory = category;
         _openSearch = search;
 
-        TxtTitle.Text = IsLive ? "TV Guide" : service.Title();
+        TxtTitle.Text = TwentyFourSeven ? "24/7 Channels" : IsLive ? "TV Guide" : service.Title();
         BtnBack.Click += (_, _) => Finish();
         BtnProfile.Click += (_, _) => Nav.Push(new ProfilePage(service));
-        BtnMulti.Visibility = IsLive ? Visibility.Visible : Visibility.Collapsed;
+        BtnMulti.Visibility = IsLive && !TwentyFourSeven ? Visibility.Visible : Visibility.Collapsed;
         BtnMulti.Click += (_, _) => Nav.Push(new MultiViewPage(service));
+        BtnSort.Visibility = IsLive ? Visibility.Collapsed : Visibility.Visible;
+        BtnSort.Click += (_, _) => ShowSortFilter();
 
-        if (service.Kind() != ContentKind.LIVE)
+        if (service.Kind() != ContentKind.LIVE && !IsLive)
         {
             BtnTabMovies.Click += (_, _) => SwitchKind(ContentKind.MOVIE);
             BtnTabSeries.Click += (_, _) => SwitchKind(ContentKind.SERIES);
@@ -135,12 +142,56 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         LazyImages.Forget(this);
     }
 
+    // ---- Sort and filter (movies and shows) ------------------------------------------
+
+    private static int YearOf(Data.Stream s)
+    {
+        var m = System.Text.RegularExpressions.Regex.Matches(s.Name ?? "", @"\b(19|20)\d{2}\b");
+        return m.Count > 0 && int.TryParse(m[^1].Value, out var y) ? y : 0;
+    }
+
+    private List<Data.Stream> Sorted(List<Data.Stream> list) => _prefs.VodSort switch
+    {
+        "newest" => list.OrderByDescending(s => s.AddedEpoch).ToList(),
+        "rating" => list.OrderByDescending(s => double.TryParse(s.Rating, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var r) ? r : 0).ToList(),
+        "year" => list.OrderByDescending(YearOf).ToList(),
+        "name" => list.OrderBy(s => (s.Name ?? "").ToLowerInvariant()).ToList(),
+        _ => list
+    };
+
+    private void ShowSortFilter()
+    {
+        var sorts = new (string Key, string Label)[]
+        {
+            ("default", "Provider order"), ("newest", "Newest added"), ("rating", "Highest rated"), ("year", "Newest year"), ("name", "A to Z")
+        };
+        var options = sorts.Select(s => (_prefs.VodSort == s.Key ? "✓ " : "") + "Sort: " + s.Label).ToList();
+        options.Add("Genre: " + (_genreFilter ?? "All genres"));
+        var which = Dialogs.Items("Sort and filter", options);
+        if (which < 0) return;
+        if (which < sorts.Length) { _prefs.VodSort = sorts[which].Key; ApplyFilter(); }
+        else PickGenre();
+    }
+
+    private void PickGenre()
+    {
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in _allStreams) foreach (var g in s.Genres) counts[g] = counts.TryGetValue(g, out var n) ? n + 1 : 1;
+        var names = counts.OrderByDescending(kv => kv.Value).Take(40).Select(kv => kv.Key).ToList();
+        var options = new List<string> { "All genres" };
+        options.AddRange(names);
+        var which = Dialogs.Items("Genre", options);
+        if (which < 0) return;
+        _genreFilter = which == 0 ? null : names[which - 1];
+        ApplyFilter();
+    }
+
     // ---- Live preview -------------------------------------------------------
 
     private void StartPreview(Data.Stream stream)
     {
         string url;
-        try { url = XtreamApi.StreamUrl(_service, _account, stream, _prefs.LiveFormat); } catch { return; }
+        try { url = XtreamApi.StreamUrl(_service, _account, stream, _prefs.LiveFormat, IsLive); } catch { return; }
         _previewStream = stream;
         try
         {
@@ -185,11 +236,36 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         if (compact == _compact && CategoryList.Children.Count + ChipsRow.Children.Count > 0) return;
         _compact = compact;
         PlaceTabs(compact);
+        EpgGrid.WideNames = TwentyFourSeven;
         // Keep the guide panel short when the window is small so the grid gets the height.
         TxtPanelDesc.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
         TxtPanelUpcoming.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
         PanelEpg.Padding = new Thickness(12, compact ? 6 : 10, 16, compact ? 6 : 10);
-        if (compact)
+        // Defaults for every mode but 24/7 channels' wide layout (below).
+        Grid.SetRow(Body, 3); Grid.SetRowSpan(Body, 1);
+        GuideArea.Margin = new Thickness(0);
+        ChipsScroll.Margin = new Thickness(12, 0, 4, 8);
+        ChipsScroll.Height = double.NaN;
+        if (TwentyFourSeven)
+        {
+            // The VOD menu keeps the left column; the categories are chips above the guide.
+            ChipsScroll.Visibility = Visibility.Visible;
+            if (compact)
+            {
+                CategoryScroll.Visibility = Visibility.Collapsed;
+                CategoryCol.Width = new GridLength(0);
+            }
+            else
+            {
+                CategoryScroll.Visibility = Visibility.Visible;
+                CategoryCol.Width = new GridLength(96);
+                Grid.SetRow(Body, 2); Grid.SetRowSpan(Body, 2);
+                ChipsScroll.Margin = new Thickness(108, 0, 4, 8);
+                ChipsScroll.Height = 40;
+                GuideArea.Margin = new Thickness(0, 48, 0, 0);
+            }
+        }
+        else if (compact)
         {
             CategoryScroll.Visibility = Visibility.Collapsed;
             CategoryCol.Width = new GridLength(0);
@@ -208,7 +284,7 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
     /// Tabs live in the top bar on wide screens and on their own full-width row on narrow ones.
     private void PlaceTabs(bool compact)
     {
-        var showTabs = _service.Kind() != ContentKind.LIVE;
+        var showTabs = _service.Kind() != ContentKind.LIVE && !IsLive;
         var buttons = new[] { BtnTabMovies, BtnTabSeries, BtnTabDownloads };
         foreach (var b in buttons)
         {
@@ -219,7 +295,7 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         Tabs.Visibility = showTabs && !compact ? Visibility.Visible : Visibility.Collapsed;
         TabsRow.Visibility = showTabs && compact ? Visibility.Visible : Visibility.Collapsed;
         // The chip row already shows the category; the top-bar label is dropped when narrow.
-        TxtCategory.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
+        TxtCategory.Visibility = compact || TwentyFourSeven ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void RenderTabs()
@@ -246,27 +322,56 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
 
     private readonly List<(FocusCard Card, Category Cat)> _categoryCards = new();
 
+    /// The Video on Demand menu, so it doesn't change when opening the 24/7 channels.
+    private void RenderRail()
+    {
+        void Add(string label, string? png, System.Windows.Media.Geometry? icon, bool selected, Action click)
+        {
+            var stack = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center };
+            if (png != null) stack.Children.Add(new Image { Source = new System.Windows.Media.Imaging.BitmapImage(new Uri($"pack://application:,,,/Assets/{png}")), Width = 22, Height = 22, Stretch = System.Windows.Media.Stretch.Uniform });
+            else stack.Children.Add(new System.Windows.Shapes.Path { Data = icon, Fill = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xCB, 0xD5, 0xE1)), Width = 22, Height = 22, Stretch = System.Windows.Media.Stretch.Uniform });
+            var text = new TextBlock { Text = label, FontSize = 13, Margin = new Thickness(0, 4, 0, 0), HorizontalAlignment = HorizontalAlignment.Center,
+                TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center,
+                Foreground = selected ? Ui.Brush("HighlightBrush") : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xCB, 0xD5, 0xE1)) };
+            stack.Children.Add(text);
+            var card = new FocusCard { Content = stack, Style = Ui.Res<Style>("VodNavItem"), Selected = selected };
+            card.Click += click;
+            card.GotKeyboardFocus += (_, _) => text.Foreground = Ui.Brush("BgBrush");
+            card.LostKeyboardFocus += (_, _) => text.Foreground = selected ? Ui.Brush("HighlightBrush") : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xCB, 0xD5, 0xE1));
+            card.Margin = _compact ? new Thickness(2, 0, 2, 4) : new Thickness(0, 0, 0, 4);
+            if (_compact) TabsRow.Children.Add(card); else CategoryList.Children.Add(card);
+        }
+        if (_compact) { TabsRow.Children.Clear(); TabsRow.Visibility = Visibility.Visible; }
+        Add("Home", "img_nav_home.png", null, false, () => Finish());
+        Add("Search", "img_nav_search.png", null, false, () => Nav.Replace(new BrowsePage(_service, ContentKind.MOVIE, search: true)));
+        Add("Categories", null, Ui.Res<System.Windows.Media.Geometry>("IconVod"), false, () => Nav.Replace(new BrowsePage(_service, ContentKind.MOVIE)));
+        Add("24/7 Channels", null, Ui.Res<System.Windows.Media.Geometry>("IconLive"), true, () => { });
+        Add("Downloads", "img_nav_downloads.png", null, false, () => Nav.Push(new TransfersPage(TransferType.DOWNLOAD)));
+        Add("Profile", "img_nav_profile.png", null, false, () => Nav.Push(new ProfilePage(_service)));
+    }
+
     private void RenderCategories()
     {
         CategoryList.Children.Clear();
         ChipsRow.Children.Clear();
         _categoryCards.Clear();
+        if (TwentyFourSeven) RenderRail();
         foreach (var c in _categories)
         {
             var cat = c;
             var card = new FocusCard
             {
-                Style = Ui.Res<Style>(_compact ? "ChipItem" : "CategoryItem"),
+                Style = Ui.Res<Style>(ChipsMode ? "ChipItem" : "CategoryItem"),
                 Selected = cat.Id == _selectedId,
                 Content = new TextBlock
                 {
-                    Text = cat.Name ?? "—", FontSize = _compact ? 13 : 14, TextTrimming = TextTrimming.CharacterEllipsis,
-                    FontWeight = _compact ? FontWeights.SemiBold : FontWeights.Normal, MaxWidth = _compact ? 200 : double.PositiveInfinity
+                    Text = cat.Name ?? "—", FontSize = ChipsMode ? 13 : 14, TextTrimming = TextTrimming.CharacterEllipsis,
+                    FontWeight = ChipsMode ? FontWeights.SemiBold : FontWeights.Normal, MaxWidth = ChipsMode ? 200 : double.PositiveInfinity
                 }
             };
             card.Click += () => SelectCategory(cat);
             _categoryCards.Add((card, cat));
-            if (_compact) ChipsRow.Children.Add(card); else CategoryList.Children.Add(card);
+            if (ChipsMode) ChipsRow.Children.Add(card); else CategoryList.Children.Add(card);
         }
         // Chips inherit the card foreground from the style trigger.
         foreach (var chip in ChipsRow.Children.OfType<FocusCard>())
@@ -285,13 +390,19 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         try
         {
             var fetched = await XtreamApi.Categories(_service, _account, _kind);
-            var cats = IsLive ? fetched.Where(c => c.Id == null || !_prefs.HiddenLiveCategories.Contains(c.Id)).ToList() : fetched;
+            // Hidden categories are the Live TV account's choice; they don't apply to 24/7 channels.
+            // 24/7 channels: only the provider's "24/7" categories (not e.g. its Movies group); with no such name, everything.
+            var only247 = TwentyFourSeven ? fetched.Where(c => c.Name?.Contains("24/7") == true).ToList() : new List<Category>();
+            var cats = TwentyFourSeven ? (only247.Count > 0 ? only247 : fetched)
+                : IsLive ? fetched.Where(c => c.Id == null || !_prefs.HiddenLiveCategories.Contains(c.Id)).ToList() : fetched;
             _providerCategories = cats;
             // With the catalogue already on disk the genre / extra groups are known now;
             // otherwise they are added as soon as it arrives (see AugmentCategories).
             var cached = IsLive ? null : CatalogCache.Peek(_service, _kind);
             List<Category> all;
-            if (IsLive)
+            if (TwentyFourSeven && only247.Count > 0)
+                all = new List<Category> { new(FAV_ID, "★ Favorites") }.Concat(cats).ToList();
+            else if (IsLive)
                 all = new List<Category> { new(FAV_ID, "★ Favorites"), new(null, "All") }.Concat(cats).ToList();
             else if (cached != null) { _augmented = true; all = await Task.Run(() => BuildVodCategories(cats, cached)); }
             else
@@ -300,7 +411,7 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
             RenderCategories();
             var wanted = _pendingCategory;
             _pendingCategory = null;
-            if (IsLive) SelectCategory(DefaultLiveCategory(all));
+            if (IsLive) SelectCategory(TwentyFourSeven ? all[1] : DefaultLiveCategory(all));
             else if (wanted != null)
             {
                 // Opened from the VOD home on a particular group (a genre row's "See all", say).
@@ -424,12 +535,18 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         var q = InputSearch.Text.Trim();
         var favs = _prefs.Favorites(_service, _kind);
         var list = _favoritesMode ? _allStreams.Where(s => s.Id != null && favs.Contains(s.Id)).ToList() : _allStreams;
-        if (IsLive)
+        if (IsLive && !TwentyFourSeven)
         {
             var hidden = _prefs.HiddenLiveCategories;
             if (hidden.Count > 0) list = list.Where(s => s.CategoryId == null || !hidden.Contains(s.CategoryId)).ToList();
         }
         if (q.Length > 0) list = list.Where(s => s.Name?.Contains(q, StringComparison.OrdinalIgnoreCase) == true).ToList();
+        if (!IsLive)
+        {
+            if (_genreFilter != null) list = list.Where(s => s.Genres.Any(g => string.Equals(g, _genreFilter, StringComparison.OrdinalIgnoreCase))).ToList();
+            list = Sorted(list);
+        }
+        _visible = list;
 
         if (IsLive)
         {
@@ -449,6 +566,10 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
     }
 
     private List<Data.Stream> _filtered = new();
+    /// The channels currently listed in the guide (after filters), used for channel up / down in the player.
+    private List<Data.Stream> _visible = new();
+    /// Genre the movie / show list is narrowed to, or null for all.
+    private string? _genreFilter;
 
     private int PosterColumns()
     {
@@ -477,7 +598,15 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
 
     // ---- Actions -------------------------------------------------------
 
+    /// Opens the movie page for a movie; everything else plays straight away.
     private void Play(Data.Stream stream)
+    {
+        if (_kind == ContentKind.MOVIE) { Nav.Push(new MoviePage(_service, stream)); return; }
+        PlayNow(stream);
+    }
+
+    /// Plays straight away (the hold-Enter menu), without the movie page.
+    private void PlayNow(Data.Stream stream)
     {
         if (_kind == ContentKind.SERIES)
         {
@@ -487,11 +616,15 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
             return;
         }
         string url;
-        try { url = XtreamApi.StreamUrl(_service, _account, stream, _prefs.LiveFormat); }
+        try { url = XtreamApi.StreamUrl(_service, _account, stream, _prefs.LiveFormat, IsLive); }
         catch (Exception e) { ShowError(string.IsNullOrWhiteSpace(e.Message) ? "Couldn't load content." : e.Message); return; }
+        // The preview is a second connection on the same account; many accounts allow only one, so the
+        // provider would refuse the full-screen stream (HTTP 403) while the preview is still open.
+        if (IsLive) ReleasePreview();
         var key = _kind == ContentKind.MOVIE && stream.StreamId != null ? WatchProgress.MovieKey(_service, stream.StreamId) : null;
         if (key != null) WatchProgress.Describe(key, WatchProgress.KIND_MOVIE, stream.Name ?? "", stream.Image, stream.ContainerExtension, stream.StreamId!);
-        Nav.Push(new PlayerPage(url, stream.Name ?? "", IsLive, key));
+        if (IsLive) ChannelQueue.Set(_service, _visible.Count > 0 ? _visible : new List<Data.Stream> { stream }, stream); else ChannelQueue.Clear();
+        Nav.Push(new PlayerPage(url, stream.Name ?? "", IsLive, key, IsLive));
     }
 
     /// Context menu opened by holding Enter / right-clicking an item.
@@ -509,7 +642,7 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         var which = Dialogs.Items(stream.Name ?? "", options);
         switch (which)
         {
-            case 0: Play(stream); break;
+            case 0: PlayNow(stream); break;
             case 1:
                 var nowFav = _prefs.ToggleFavorite(_service, _kind, id);
                 Dialogs.Toast(nowFav ? $"{stream.Name} added to favorites" : $"{stream.Name} removed from favorites");
@@ -558,7 +691,7 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
     {
         // Recordings always use the MPEG-TS stream so the file plays back directly.
         string url;
-        try { url = XtreamApi.StreamUrl(_service, _account, stream, "ts"); }
+        try { url = XtreamApi.StreamUrl(_service, _account, stream, "ts", true); }
         catch (Exception e) { Dialogs.Toast(e.Message); return; }
         TransferDialogs.Record(stream.Name ?? "Channel", url);
     }
@@ -570,6 +703,7 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
         var mode = _prefs.GuideMode;
         var remembered = _prefs.GuideSize(_service);
         var usePerChannel = mode == "channel" || (mode == "auto" && remembered > FULL_GUIDE_LIMIT);
+        AppLog.I("Epg", $"guide mode={mode} remembered={remembered / (1024 * 1024)}MB perChannel={usePerChannel} channels={_allStreams.Count} shortEpgPaused={EpgCache.ShortEpgPaused(_service)}");
         long lastBytes = 0;
         var ok = false;
         if (!usePerChannel)
@@ -628,7 +762,9 @@ public partial class BrowsePage : AppPage, EpgGridView.IListener
     {
         _prefetchCts?.Cancel();
         var cts = _prefetchCts = new CancellationTokenSource();
-        var channels = _allStreams;
+        // Only the first screens' worth up front; the grid asks for the rest as rows scroll into view
+        // (OnNeedEpg). Sweeping every channel of a big list meant thousands of requests per visit.
+        var channels = _allStreams.Take(PREFETCH_LIMIT).ToList();
         var total = channels.Count;
         var done = 0;
         long lastShown = 0;
