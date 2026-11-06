@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
   "packageName": "com.computergarage.mediahere.windows",
-  "versionName": "1.1.3",
-  "versionCode": 10103,
+  "versionName": "1.1.4",
+  "versionCode": 10104,
   "setup": {
-    "assetName": "MediaHere-Setup-1.1.3.exe",
-    "sha256": "84c37c5aa3be13f350f636d9f8bc8e884b08b318bdca55d06f7a2bed9c1c9b70",
-    "sizeBytes": 103563772
+    "assetName": "MediaHere-Setup-1.1.4.exe",
+    "sha256": "d63268cea008c82c9461570764e7e013d4d8da3d9e650ae4ee1ccbacd6a416c5",
+    "sizeBytes": 104321941
   },
   "zip": {
-    "assetName": "MediaHere-Windows-1.1.3-x64.zip",
-    "sha256": "3e85a4cf6f5872b73678dec4190d735e9b6939be25351387d32bef77326f0133",
-    "sizeBytes": 150919910
+    "assetName": "MediaHere-Windows-1.1.4-x64.zip",
+    "sha256": "7910cf76a05377b261f2e367af10615398218e94336e5afc9000c08500b1b46b",
+    "sizeBytes": 151614852
   }
 }
