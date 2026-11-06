@@ -3,6 +3,11 @@
 All notable changes to the Windows edition are listed here. The section for each version is shown
 to users inside the app when an update is available.
 
+## v1.1.1 — 2026-11-06
+
+### Changed
+- New MediaHere logo and app icon.
+
 ## v1.1.0 — 2026-11-06
 
 ### Changed
