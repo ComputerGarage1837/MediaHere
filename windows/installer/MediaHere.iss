@@ -48,7 +48,8 @@ WizardStyle=modern
 CloseApplications=yes
 CloseApplicationsFilter=*.exe,*.dll
 RestartApplications=no
-ChangesAssociations=no
+; Makes Setup tell Explorer to refresh icons, so shortcuts and the taskbar show the new logo.
+ChangesAssociations=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -60,9 +61,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\{#AppExe}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
 ; Offered at the end of an interactive install and done automatically by a silent in-app update.
@@ -73,6 +74,18 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#StringChange(AppN
 Type: files; Name: "{app}\*.old"
 
 [Code]
+// After files are in place, drop Windows' cached icons so the desktop shortcut, Start menu and
+// taskbar pick up the new app icon instead of the old one.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    Exec(ExpandConstant('{sys}\ie4uinit.exe'), '-show', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+end;
+
 // Removes the scheduled recording tasks the app registers ("MediaHere Recording <id>"), so
 // nothing tries to start a program that is gone. Downloads and settings are kept.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

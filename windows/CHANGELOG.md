@@ -3,6 +3,11 @@
 All notable changes to the Windows edition are listed here. The section for each version is shown
 to users inside the app when an update is available.
 
+## v1.1.6 — 2026-11-06
+
+### Fixed
+- The new MediaHere icon now shows on the desktop shortcut, Start menu and taskbar after an update (Windows kept the old one cached).
+
 ## v1.1.5 — 2026-11-06
 
 ### Changed
